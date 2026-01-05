@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-#
+# 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -39,7 +39,6 @@ try:
     HAS_CUE_OPS = True
 except ImportError:
     HAS_CUE_OPS = False
-
 
 class SegmentedPolynomial(nn.Module):
     """PyTorch module that computes a segmented polynomial.
@@ -143,6 +142,7 @@ class SegmentedPolynomial(nn.Module):
         math_dtype: str | torch.dtype = None,
         output_dtype_map: List[int] = None,
         name: str = "segmented_polynomial",
+        op_name: str = "",
     ):
         super().__init__()
 
@@ -150,7 +150,8 @@ class SegmentedPolynomial(nn.Module):
         self.num_outputs = polynomial.num_outputs
         self.method = method
         self.repr = polynomial.__repr__()
-
+        self.op_name = op_name
+        
         if method == "":
             warnings.warn(
                 "Hello! It looks like you're using code that was written for an older version of this library.\n"
@@ -179,7 +180,7 @@ class SegmentedPolynomial(nn.Module):
 
         if method == "uniform_1d":
             self.m = SegmentedPolynomialFromUniform1dJit(
-                polynomial, math_dtype, output_dtype_map, name
+                polynomial, math_dtype, output_dtype_map, name, op_name
             )
             self.fallback = self.m
         elif method == "naive":
@@ -304,5 +305,4 @@ class SegmentedPolynomial(nn.Module):
                     return self.fallback(
                         inputs, input_indices, output_shapes, output_indices
                     )
-
         return self.m(inputs, input_indices, output_shapes, output_indices)

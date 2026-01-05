@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Modified by mlx in 2025
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,6 +15,7 @@
 # limitations under the License.
 import warnings
 from typing import Dict, Optional
+import time
 
 import torch
 from cuequivariance.group_theory.irreps_array.misc_ui import (
@@ -67,6 +69,7 @@ class Linear(torch.nn.Module):
         math_dtype: Optional[str | torch.dtype] = None,
         use_fallback: Optional[bool] = None,
         method: Optional[str] = None,
+        use_fasteq: bool = False,
     ):
         super().__init__()
         irreps_in, irreps_out = default_irreps(irreps_in, irreps_out)
@@ -140,6 +143,16 @@ class Linear(torch.nn.Module):
             math_dtype=math_dtype,
         ).to(device)
 
+        self.use_fasteq = use_fasteq
+        if use_fasteq:
+            self.ff = cuet.FastEqSegmentedPolynomial(
+                e.polynomial,
+                method=self.method,
+                math_dtype=math_dtype,
+                use_fasteq=use_fasteq,
+                op_name="equi_linear", # equivariant linear
+            ).to(device)
+
     def extra_repr(self) -> str:
         return f"shared_weights={self.shared_weights}, internal_weights={self.internal_weights}, weight_numel={self.weight_numel}"
 
@@ -187,5 +200,25 @@ class Linear(torch.nn.Module):
         if weight is None:
             raise ValueError("Weights should not be None")
 
-        output = self.f([weight, self.transpose_in(x)], input_indices=input_indices)
+        if self.use_fasteq:
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
+
+            output = self.ff([weight, self.transpose_in(x)], input_indices=input_indices)
+            
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"<< fasteq equi-linear forward cost: {execution_time_ms:.3f} ms >>")
+        else:
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
+
+            output = self.f([weight, self.transpose_in(x)], input_indices=input_indices)
+
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"<< cueq equi-linear forward cost: {execution_time_ms:.3f} ms >>")
+
         return self.transpose_out(output[0])
