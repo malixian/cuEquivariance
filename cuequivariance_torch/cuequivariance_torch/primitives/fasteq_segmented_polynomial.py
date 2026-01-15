@@ -84,6 +84,13 @@ def infer_cwtp_meta(
     IU_TOTAL = int(descriptor.operands[1].size)
     JV_TOTAL = int(descriptor.operands[2].size)
 
+    '''
+    for ops in descriptor.operands:
+        print(f"==== ops: {ops} ====")
+        for seg in ops.segments:
+            print(f"seg: {seg}")
+    '''
+
     print(f"UV_TOTAL:{UV_TOTAL}, IU_TOTAL:{IU_TOTAL}, JV_TOTAL:{JV_TOTAL}")
     P = len(path_indices)
 
@@ -186,6 +193,8 @@ def infer_cwtp_meta(
         nz_idx = torch.nonzero(c != 0, as_tuple=False)  # [nnz,3] (i,j,k)
         nnz = int(nz_idx.size(0))
 
+        print(f"cwtp nnz path:{path_id}, nnz idx:{nz_idx}")
+
         nnz_per_path.append(nnz)
         nnz_offsets.append(nnz_running)
         nnz_running += nnz
@@ -199,6 +208,8 @@ def infer_cwtp_meta(
             i_idx = nz_sorted[:, 0]
             j_idx = nz_sorted[:, 1]
             k_idx = nz_sorted[:, 2]
+
+            print(f"cwtp sort k {i_idx},{j_idx},{k_idx}")
 
             vals = c[i_idx, j_idx, k_idx]
 
@@ -296,6 +307,165 @@ def infer_cwtp_meta(
         "MAX_K_DIM": int(max_k_dim_for_kernel),
     }
     return meta
+
+@torch.no_grad()
+def build_k_sliced_ell_packed(
+    num_paths: int,
+    MAX_K_DIM: int,
+    k_dims: torch.Tensor,          # [num_paths] int32
+    nnz_offsets: torch.Tensor,     # [num_paths] int32
+    nnz_k_offsets: torch.Tensor,   # [num_paths * MAX_K_DIM] int32
+    nnz_k_counts: torch.Tensor,    # [num_paths * MAX_K_DIM] int32
+    cg_i_all: torch.Tensor,        # [nnz_total] uint8
+    cg_j_all: torch.Tensor,        # [nnz_total] uint8
+    cg_val_all: torch.Tensor,      # [nnz_total] float/double
+    sort_within_k: bool = True,    # 可选：每个k内按(i,j)排序
+):
+    """
+    输出：
+      ell_E    : [num_paths] int32，E[p]=max nnz per k
+      ell_base : [num_paths] int32，ell_ij/ell_val 的起点（以 element 为单位）
+      ell_ij   : [ell_total] uint16，按 (k_local * E + e) 排布
+      ell_val  : [ell_total] scalar，同上
+    """
+
+
+    assert k_dims.dtype == torch.int32
+    assert nnz_offsets.dtype == torch.int32
+    assert nnz_k_offsets.dtype == torch.int32
+    assert nnz_k_counts.dtype == torch.int32
+    assert cg_i_all.dtype == torch.uint8 and cg_j_all.dtype == torch.uint8
+    assert cg_val_all.dtype in (torch.float16, torch.float32, torch.float64)
+
+    device = cg_val_all.device
+    # 预处理最好在 CPU 做（更快/省GPU时间），最后再 .to(device)
+    # 如果你的这些 tensor 在 GPU 上，可以先搬回 CPU
+    k_dims_cpu        = k_dims.cpu()
+    nnz_offsets_cpu   = nnz_offsets.cpu()
+    nnz_k_offsets_cpu = nnz_k_offsets.cpu()
+    nnz_k_counts_cpu  = nnz_k_counts.cpu()
+    cg_i_cpu          = cg_i_all.cpu()
+    cg_j_cpu          = cg_j_all.cpu()
+    cg_val_cpu        = cg_val_all.cpu()
+
+    # 1) 计算 E[p]
+    ell_E_cpu = torch.empty((num_paths,), dtype=torch.int32)
+    for p in range(num_paths):
+        k_dim = int(k_dims_cpu[p].item())
+        if k_dim <= 0:
+            ell_E_cpu[p] = 0
+            continue
+        counts = nnz_k_counts_cpu[p * MAX_K_DIM : p * MAX_K_DIM + k_dim]
+        ell_E_cpu[p] = int(counts.max().item()) if counts.numel() > 0 else 0
+
+    # 2) 计算 base 偏移（prefix sum）
+    ell_base_cpu = torch.empty((num_paths,), dtype=torch.int32)
+    total = 0
+    for p in range(num_paths):
+        ell_base_cpu[p] = total
+        k_dim = int(k_dims_cpu[p].item())
+        E = int(ell_E_cpu[p].item())
+        total += k_dim * E
+
+    # 3) 分配 ELL 数组（pad: val=0，ij=0）
+    ell_ij_cpu  = torch.zeros((total,), dtype=torch.uint16)
+    ell_val_cpu = torch.zeros((total,), dtype=cg_val_cpu.dtype)
+
+    # 4) 填充
+    for p in range(num_paths):
+        k_dim = int(k_dims_cpu[p].item())
+        if k_dim <= 0:
+            continue
+        E = int(ell_E_cpu[p].item())
+        if E <= 0:
+            continue
+
+        base = int(ell_base_cpu[p].item())
+        nnz_off = int(nnz_offsets_cpu[p].item())
+
+        for k_local in range(k_dim):
+            meta_idx = p * MAX_K_DIM + k_local
+            local_off = int(nnz_k_offsets_cpu[meta_idx].item())
+            local_cnt = int(nnz_k_counts_cpu[meta_idx].item())
+            # 该k的输出行起点
+            row = base + k_local * E
+
+            if local_cnt <= 0:
+                continue
+
+            # 拿到该k的 nnz 索引范围：idx = nnz_off + (local_off + tt)
+            idxs = torch.arange(local_off, local_off + local_cnt, dtype=torch.int32)
+            gidx = (nnz_off + idxs).to(torch.int64)  # 作为索引用 int64
+
+            ii = cg_i_cpu[gidx].to(torch.int32)
+            jj = cg_j_cpu[gidx].to(torch.int32)
+            vv = cg_val_cpu[gidx]
+
+            if sort_within_k:
+                # sort key: i major then j
+                key = ii * 256 + jj
+                order = torch.argsort(key)
+                ii = ii[order]; jj = jj[order]; vv = vv[order]
+
+            # 写入前 local_cnt 个，其余 pad=0
+            w = min(local_cnt, E)
+            # pack: ij = i | (j<<8)
+            ij = (ii[:w] & 0xFF) | ((jj[:w] & 0xFF) << 8)
+            ell_ij_cpu[row : row + w]  = ij.to(torch.uint16)
+            ell_val_cpu[row : row + w] = vv[:w]
+
+            # pad 部分已是0：val=0 => acc +=0，可无分支
+
+    # 5) 搬回 device（通常是 GPU）
+    ell_E    = ell_E_cpu.to(device=device)
+    ell_base = ell_base_cpu.to(device=device)
+    ell_ij   = ell_ij_cpu.to(device=device)
+    ell_val  = ell_val_cpu.to(device=device)
+    ell_meta = {
+        "ell_E": ell_E,
+        "ell_base": ell_base,
+        "ell_ij": ell_ij,
+        "ell_val": ell_val,
+    }
+    return ell_meta
+
+@torch.no_grad()
+def build_packed_meta(path_indices: torch.Tensor,
+                      k_dims: torch.Tensor,
+                      ell_E: torch.Tensor,
+                      ell_base: torch.Tensor,
+                      iu_seg_offsets: torch.Tensor,
+                      jv_seg_offsets: torch.Tensor,
+                      kv_k_offsets: torch.Tensor,
+                      U: int):
+    """
+    path_indices: [P,4] int32 (uv_idx, iu_idx, jv_idx, kv_idx)
+    k_dims:      [P]   int32
+    ell_E:       [P]   int32
+    ell_base:    [P]   int32
+    offsets: small fixed int32 tensors on GPU
+    returns:
+      meta1: [P,4] int32  (uv_base, iu_base, jv_base, k_base)
+      meta2: [P,4] int32  (k_dim, E, ell_base, pad)
+    """
+    assert path_indices.dtype == torch.int32 and path_indices.is_cuda
+    P = path_indices.shape[0]
+
+    uv_idx = path_indices[:, 0]
+    iu_idx = path_indices[:, 1]
+    jv_idx = path_indices[:, 2]
+    kv_idx = path_indices[:, 3]
+
+    uv_base = uv_idx * U                         # V==1, x_uv is [K][U]
+    iu_base = iu_seg_offsets[iu_idx]             # gather from tiny fixed offsets
+    jv_base = jv_seg_offsets[jv_idx]
+    k_base  = kv_k_offsets[kv_idx]
+
+    meta1 = torch.stack([uv_base, iu_base, jv_base, k_base], dim=1).contiguous()  # [P,4] int32
+    pad   = torch.zeros((P,), device=meta1.device, dtype=torch.int32)
+    meta2 = torch.stack([k_dims, ell_E, ell_base, pad], dim=1).contiguous()       # [P,4] int32
+
+    return meta1, meta2
 
 @torch.no_grad()
 def infer_fctp_meta(descriptor, math_dtype, device):
@@ -506,6 +676,7 @@ class FastEqSegmentedPolynomial(nn.Module):
         self.op_name = op_name
         self.descriptor = polynomial.operations[0][1]
         self.use_fasteq = use_fasteq
+        self.polynomial = polynomial
         
         if method == "":
             warnings.warn(
@@ -614,6 +785,41 @@ class FastEqSegmentedPolynomial(nn.Module):
         
         if use_fasteq and (op_name == "cwtp"):
             self.meta = infer_cwtp_meta(self.descriptor, math_dtype=math_dtype, device="cuda") # device hardcoded for now
+            cg_i_groupk = self.meta["cg_i_all"]
+            cg_j_groupk  = self.meta["cg_j_all"]
+            cg_val_groupk  = self.meta["cg_val_all"]
+            nnz_per_path = self.meta["nnz_per_path"]
+            nnz_offsets_groupk = self.meta["nnz_offsets"]
+            nnz_k_offsets_groupk = self.meta["nnz_k_offsets"]
+            nnz_k_counts_groupk = self.meta["nnz_k_counts"]
+            k_dims = self.meta["k_dims"]
+
+            num_paths = nnz_per_path.shape[0]
+            self.ell_meta = build_k_sliced_ell_packed(
+                num_paths=num_paths,
+                MAX_K_DIM=8,
+                k_dims=k_dims,                  # int32
+                nnz_offsets=nnz_offsets_groupk,         # int32
+                nnz_k_offsets=nnz_k_offsets_groupk,     # int32
+                nnz_k_counts=nnz_k_counts_groupk,       # int32
+                cg_i_all=cg_i_groupk,               # uint8
+                cg_j_all=cg_j_groupk,               # uint8
+                cg_val_all=cg_val_groupk,           # float/double
+                sort_within_k=True,
+            )
+
+            uv_seg_offsets = self.meta["uv_seg_offsets"]
+            iu_seg_offsets = self.meta["iu_seg_offsets"]
+            jv_seg_offsets = self.meta["jv_seg_offsets"]
+            kv_k_offsets = self.meta["kv_k_offsets"]
+            path_indices = self.meta["path_indices_tensor"]
+            U = self.meta["U"]
+
+            meta1, meta2 = build_packed_meta(path_indices, k_dims, self.ell_meta["ell_E"], self.ell_meta["ell_base"], iu_seg_offsets, jv_seg_offsets, kv_k_offsets, U)
+
+            self.ell_meta["meta1"] = meta1
+            self.ell_meta["meta2"] = meta2
+
         
         if use_fasteq and (op_name == "fctp"):
             self.meta = infer_fctp_meta(self.descriptor, math_dtype=math_dtype, device="cuda") # device hardcoded for now
@@ -663,7 +869,7 @@ class FastEqSegmentedPolynomial(nn.Module):
             The output tensors resulting from the segmented polynomial.
             Their shapes are specified just like the inputs.
         """
-
+        print(f"op name:{self.op_name}, polynomial.operations:{self.polynomial.operations}")
         # General checks
         empty_dict: Dict[int, torch.Tensor] = {}
         if input_indices is None:
@@ -776,6 +982,7 @@ class FastEqSegmentedPolynomial(nn.Module):
                     ref = fast_cwtp(
                         w, x, y,
                         self.meta,
+                        self.ell_meta,
                     )
                     out[0] = ref
             elif self.op_name == "fctp":
