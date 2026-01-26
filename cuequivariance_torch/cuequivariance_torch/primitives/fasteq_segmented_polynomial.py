@@ -91,7 +91,6 @@ def infer_cwtp_meta(
             print(f"seg: {seg}")
     '''
 
-    print(f"UV_TOTAL:{UV_TOTAL}, IU_TOTAL:{IU_TOTAL}, JV_TOTAL:{JV_TOTAL}")
     P = len(path_indices)
 
     # segment counts
@@ -193,8 +192,6 @@ def infer_cwtp_meta(
         nz_idx = torch.nonzero(c != 0, as_tuple=False)  # [nnz,3] (i,j,k)
         nnz = int(nz_idx.size(0))
 
-        print(f"cwtp nnz path:{path_id}, nnz idx:{nz_idx}")
-
         nnz_per_path.append(nnz)
         nnz_offsets.append(nnz_running)
         nnz_running += nnz
@@ -208,8 +205,6 @@ def infer_cwtp_meta(
             i_idx = nz_sorted[:, 0]
             j_idx = nz_sorted[:, 1]
             k_idx = nz_sorted[:, 2]
-
-            print(f"cwtp sort k {i_idx},{j_idx},{k_idx}")
 
             vals = c[i_idx, j_idx, k_idx]
 
@@ -784,6 +779,14 @@ class FastEqSegmentedPolynomial(nn.Module):
             ).to(device)
         
         if use_fasteq and (op_name == "cwtp"):
+            # for hip mptp
+            operand_extent = 1
+            o = polynomial.operands[0]
+            print(f"o.ndim:{o.ndim}, o.segment_shape:{o.segment_shape}")
+            operand_extent = o.segment_shape[0]
+            self.buffer_num_segments = [len(o.segments) for o in polynomial.operands]
+            self.operand_extent = operand_extent
+
             self.meta = infer_cwtp_meta(self.descriptor, math_dtype=math_dtype, device="cuda") # device hardcoded for now
             cg_i_groupk = self.meta["cg_i_all"]
             cg_j_groupk  = self.meta["cg_j_all"]
@@ -869,7 +872,6 @@ class FastEqSegmentedPolynomial(nn.Module):
             The output tensors resulting from the segmented polynomial.
             Their shapes are specified just like the inputs.
         """
-        print(f"op name:{self.op_name}, polynomial.operations:{self.polynomial.operations}")
         # General checks
         empty_dict: Dict[int, torch.Tensor] = {}
         if input_indices is None:
