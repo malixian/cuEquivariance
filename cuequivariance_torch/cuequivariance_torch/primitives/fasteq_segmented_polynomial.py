@@ -180,7 +180,7 @@ def infer_cwtp_meta(
     # -------------------- 7) sparse CG meta + per-k grouping --------------------
     cg_i_list, cg_j_list, cg_k_list, cg_val_list = [], [], [], []
     nnz_per_path = []
-    nnz_offsets = []  # NOTE: this is "start offset per path", length P (kept as your original)
+    nnz_offsets = [] 
 
     nnz_k_offsets_list = []  # [P, MAX_K_DIM]
     nnz_k_counts_list  = []  # [P, MAX_K_DIM]
@@ -191,6 +191,8 @@ def infer_cwtp_meta(
 
         nz_idx = torch.nonzero(c != 0, as_tuple=False)  # [nnz,3] (i,j,k)
         nnz = int(nz_idx.size(0))
+
+        #print(f"cwtp nnz path:{path_id}, nnz idx:{nz_idx}")
 
         nnz_per_path.append(nnz)
         nnz_offsets.append(nnz_running)
@@ -333,8 +335,6 @@ def build_k_sliced_ell_packed(
     assert cg_val_all.dtype in (torch.float16, torch.float32, torch.float64)
 
     device = cg_val_all.device
-    # 预处理最好在 CPU 做（更快/省GPU时间），最后再 .to(device)
-    # 如果你的这些 tensor 在 GPU 上，可以先搬回 CPU
     k_dims_cpu        = k_dims.cpu()
     nnz_offsets_cpu   = nnz_offsets.cpu()
     nnz_k_offsets_cpu = nnz_k_offsets.cpu()
@@ -463,12 +463,52 @@ def build_packed_meta(path_indices: torch.Tensor,
     return meta1, meta2
 
 @torch.no_grad()
+def make_p_for_k(K_per_path, device):
+    K_total = sum(K_per_path)
+    p_for_k = torch.empty((K_total,), device=device, dtype=torch.int32)
+    off = 0
+    for p, kp in enumerate(K_per_path):
+        p_for_k[off:off+kp] = p
+        off += kp
+    return p_for_k
+
+
+@torch.no_grad()
+def make_cg_single_mapping(K_total, I_total, device, path_num):
+    """
+    Build i_for_k[K], val_for_k[K], each k has at most one nnz (or empty).
+      diag    : i_for_k[k]=k if k<I_total
+      single0 : only k=0 uses i=0
+    """
+    i_for_k = torch.full((K_total,), -1, device=device, dtype=torch.int32)
+    val_for_k = torch.zeros((K_total,), device=device, dtype=torch.float64)
+
+    # "diag"
+    if path_num == 4:
+        kk = torch.arange(K_total, device=device, dtype=torch.int32)
+        mask = kk < I_total
+        i_for_k[mask] = kk[mask]
+        val_for_k[mask] = 1.0
+    elif path_num == 1:
+        if K_total > 0:
+            i_for_k[0] = 0
+            val_for_k[0] = 1.0
+    else:
+        raise ValueError(f"Unknown path_num: {path_num}")
+
+    return i_for_k, val_for_k
+
+@torch.no_grad()
 def infer_fctp_meta(descriptor, math_dtype, device):
     # per-path tensors
     cg_indices = []
     cg_values  = []
     c_tensors  = []
     dim_list   = []
+
+    print(f"i dims:", sum(descriptor.get_dims("i")))
+    print(f"j dims:", sum(descriptor.get_dims("j")))
+    print(f"k dims:", sum(descriptor.get_dims("k")))
 
     # 1) build per-path (idx, val, coeffs)
     for i, path in enumerate(descriptor.paths):
@@ -502,7 +542,11 @@ def infer_fctp_meta(descriptor, math_dtype, device):
     path_offset[0] = 0
     if P > 1:
         path_offset[1:] = torch.cumsum(K_per_path[:-1], dim=0)
-    K_total = int(K_per_path.sum().item())
+    
+    #K_total = int(K_per_path.sum().item())
+    I_total = sum(descriptor.get_dims("i"))
+    K_total = sum(descriptor.get_dims("k"))
+
 
     # 4) pack nnz info
     nnz_list = [int(ci.shape[0]) for ci in cg_indices]
@@ -534,6 +578,9 @@ def infer_fctp_meta(descriptor, math_dtype, device):
         cg_j_all[p, :nnz_p]   = j_global
         cg_k_all[p, :nnz_p]   = k_global
         cg_val_all[p, :nnz_p] = cv
+    
+    i_for_k, val_for_k = make_cg_single_mapping(K_total, I_total, device, P)
+    p_for_k = make_p_for_k(K_per_path, device)
 
     return {
         "cg_indices": cg_indices,
@@ -545,6 +592,7 @@ def infer_fctp_meta(descriptor, math_dtype, device):
         "P": P,
         "K_per_path": K_per_path,
         "path_offset": path_offset,
+        "I_total": I_total,
         "K_total": K_total,
 
         "nnz_list": nnz_list,
@@ -555,6 +603,9 @@ def infer_fctp_meta(descriptor, math_dtype, device):
         "cg_j_all": cg_j_all,
         "cg_k_all": cg_k_all,
         "cg_val_all": cg_val_all,
+        "i_for_k": i_for_k,
+        "val_for_k": val_for_k,
+        "p_for_k": p_for_k
     }
 
 class FastEqSegmentedPolynomial(nn.Module):
@@ -872,6 +923,7 @@ class FastEqSegmentedPolynomial(nn.Module):
             The output tensors resulting from the segmented polynomial.
             Their shapes are specified just like the inputs.
         """
+        #print(f"op name:{self.op_name}, polynomial.operations:{self.polynomial.operations}")
         # General checks
         empty_dict: Dict[int, torch.Tensor] = {}
         if input_indices is None:
