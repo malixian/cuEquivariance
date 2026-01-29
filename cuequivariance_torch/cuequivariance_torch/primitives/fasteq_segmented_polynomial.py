@@ -936,11 +936,12 @@ class FastEqSegmentedPolynomial(nn.Module):
                     raise ValueError("equi_linear should have exactly one output")
             
             if self.op_name == "equi_linear":
-                if tuple(inputs[0].shape) == (1, 36864):
-                    ref = fast_equi_linear(self.descriptor, inputs[0], inputs[1])
-                    out[0] = ref
-                else:
-                    return self.m(inputs, input_indices, output_shapes, output_indices)
+                #if tuple(inputs[0].shape) == (1, 36864):
+                #    ref = fast_equi_linear(self.descriptor, inputs[0], inputs[1])
+                #    out[0] = ref
+                #else:
+                #    return self.m(inputs, input_indices, output_shapes, output_indices)
+                return self.m(inputs, input_indices, output_shapes, output_indices)
             elif self.op_name == "stc":
                 i0 = input_indices[0].to(torch.int32)
                 x0 = inputs[0]
