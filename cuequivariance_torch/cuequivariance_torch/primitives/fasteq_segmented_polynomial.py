@@ -474,14 +474,14 @@ def make_p_for_k(K_per_path, device):
 
 
 @torch.no_grad()
-def make_cg_single_mapping(K_total, I_total, device, path_num):
+def make_cg_single_mapping(K_total, I_total, device, path_num, math_dtype):
     """
     Build i_for_k[K], val_for_k[K], each k has at most one nnz (or empty).
       diag    : i_for_k[k]=k if k<I_total
       single0 : only k=0 uses i=0
     """
     i_for_k = torch.full((K_total,), -1, device=device, dtype=torch.int32)
-    val_for_k = torch.zeros((K_total,), device=device, dtype=torch.float64)
+    val_for_k = torch.zeros((K_total,), device=device, dtype=math_dtype)
 
     # "diag"
     if path_num == 4:
@@ -579,7 +579,7 @@ def infer_fctp_meta(descriptor, math_dtype, device):
         cg_k_all[p, :nnz_p]   = k_global
         cg_val_all[p, :nnz_p] = cv
     
-    i_for_k, val_for_k = make_cg_single_mapping(K_total, I_total, device, P)
+    i_for_k, val_for_k = make_cg_single_mapping(K_total, I_total, device, P, math_dtype)
     p_for_k = make_p_for_k(K_per_path, device)
 
     return {
