@@ -41,11 +41,15 @@ try:
 except ImportError:
     HAS_CUE_OPS = False
 
+import time
+from mace.tools.scatter import scatter_sum
+
 from fasteq.ops.equi_linear import fast_equi_linear
 from fasteq.ops.stc import fast_stc
 from fasteq.ops.cwtp import fast_cwtp
 from fasteq.ops.mptp import fast_mptp
 from fasteq.ops.fctp import fast_fctp
+from fasteq.ops.uniform1d import fast_uniform1d
 
 @torch.no_grad()
 def infer_cwtp_meta(
@@ -305,6 +309,46 @@ def infer_cwtp_meta(
     }
     return meta
 
+
+def build_grouped_paths(path_segment_indices: torch.Tensor,
+                        path_coefficients: torch.Tensor,
+                        V: int,
+                        device=None):
+    """
+    path_segment_indices: [P,4] int64/int32, columns: i,j,k,v
+    path_coefficients:    [P]   float32/float64
+    returns:
+      i_list, j_list, k_list: [P] int32
+      coeff_list:             [P] same dtype as coefficients
+      v_offsets:              [V+1] int32, CSR-like offsets into lists
+    """
+    assert path_segment_indices.ndim == 2 and path_segment_indices.size(1) == 4
+    P = path_segment_indices.size(0)
+    if device is None:
+        device = path_segment_indices.device
+
+    psi = path_segment_indices.to("cpu")
+    coeff = path_coefficients.to("cpu")
+
+    v = psi[:, 3].to(torch.int64)
+    # sort by v
+    order = torch.argsort(v, stable=True)
+    psi_s = psi[order]
+    coeff_s = coeff[order]
+
+    v_s = psi_s[:, 3].to(torch.int64)
+    counts = torch.bincount(v_s, minlength=V)
+    v_offsets = torch.zeros(V + 1, dtype=torch.int32)
+    v_offsets[1:] = torch.cumsum(counts, dim=0).to(torch.int32)
+
+    i_list = psi_s[:, 0].to(torch.int32).contiguous().to(device)
+    j_list = psi_s[:, 1].to(torch.int32).contiguous().to(device)
+    k_list = psi_s[:, 2].to(torch.int32).contiguous().to(device)
+    coeff_list = coeff_s.contiguous().to(device)
+    v_offsets = v_offsets.contiguous().to(device)
+
+    return i_list, j_list, k_list, coeff_list, v_offsets
+
 @torch.no_grad()
 def build_k_sliced_ell_packed(
     num_paths: int,
@@ -506,9 +550,9 @@ def infer_fctp_meta(descriptor, math_dtype, device):
     c_tensors  = []
     dim_list   = []
 
-    print(f"i dims:", sum(descriptor.get_dims("i")))
-    print(f"j dims:", sum(descriptor.get_dims("j")))
-    print(f"k dims:", sum(descriptor.get_dims("k")))
+    #print(f"i dims:", sum(descriptor.get_dims("i")))
+    #print(f"j dims:", sum(descriptor.get_dims("j")))
+    #print(f"k dims:", sum(descriptor.get_dims("k")))
 
     # 1) build per-path (idx, val, coeffs)
     for i, path in enumerate(descriptor.paths):
@@ -775,6 +819,8 @@ class FastEqSegmentedPolynomial(nn.Module):
         else:
             raise ValueError(f"Invalid method: {method}")
 
+        print(f"Init op:{op_name}")
+
         if use_fasteq and op_name == "stc":
             import math
             from torch.nn.utils.rnn import pad_sequence
@@ -869,6 +915,34 @@ class FastEqSegmentedPolynomial(nn.Module):
         
         if use_fasteq and (op_name == "fctp"):
             self.meta = infer_fctp_meta(self.descriptor, math_dtype=math_dtype, device="cuda") # device hardcoded for now
+        
+        if use_fasteq and (op_name == "uniform1d"):
+            #print(f"op_name:{op_name}, desc:{self.descriptor}")
+            ds_ = [d for _, d in polynomial.operations]
+            self.path_segment_indices = sum((d.indices.tolist() for  d in ds_), [])
+            self.path_coefficients = sum((d.stacked_coefficients.tolist() for d in ds_), [])
+            self.num_segments_list = [ operand.num_segments for operand in self.descriptor.operands]
+            #print(f"path_segment_indices len:{len(self.path_segment_indices)}, {self.path_segment_indices}")
+            #print(f"len:{len(self.path_coefficients)}, path_coefficients:{self.path_coefficients}")
+
+            path_segment_indices_tensor = torch.tensor(self.path_segment_indices, dtype=torch.int32, device="cuda")
+            path_coefficients_tensor = torch.tensor(self.path_coefficients, dtype=math_dtype, device="cuda")
+            self.u_dim = list(self.descriptor.get_dims("u"))[0]
+            out_segment_num = self.num_segments_list[3]
+            self.i_list, self.j_list, self.k_list, self.coeff_list, self.v_offsets = build_grouped_paths(path_segment_indices_tensor, path_coefficients_tensor, out_segment_num, "cuda")
+            self.u1d_meta = {}
+
+            self.u1d_meta["src_indices"] = meta["src_indices"]
+            self.u1d_meta["i_list"] = meta["i_list"]
+            self.u1d_meta["j_list"] = meta["j_list"]
+            self.u1d_meta["k_list"] = meta["k_list"]
+            self.u1d_meta["coeff_list"] = meta["coeff_list"]
+            self.u1d_meta["v_offsets"] = meta["v_offsets"]
+            self.u1d_meta["out_seg_num"] = meta["out_seg_num"]
+            self.u1d_meta["w_seg_num"] = meta["w_seg_num"]
+            self.u1d_meta["x_seg_num"] = meta["x_seg_num"]
+            self.u1d_meta["y_seg_num"] = meta["y_seg_num"]
+
 
     def __repr__(self):
         return self.repr + f"\n{super().__repr__()}"
@@ -980,11 +1054,37 @@ class FastEqSegmentedPolynomial(nn.Module):
                     raise ValueError("equi_linear should have exactly one output")
             
             if self.op_name == "equi_linear":
-                if tuple(inputs[0].shape) == (1, 36864):
+                '''
+                if tuple(inputs[0].shape) == (1, 36864) or tuple(inputs[0].shape) == (1, 163840) or tuple(inputs[0].shape) == (1, 852992):
+                        torch.cuda.synchronize()
+                        start_time = time.perf_counter() * 1000
+
+                        ref = fast_equi_linear(self.descriptor, inputs[0], inputs[1])
+
+                        torch.cuda.synchronize()
+                        end_time = time.perf_counter() * 1000
+                        execution_time_ms = end_time - start_time
+                        print(f" fasteq equi-linear forward cost: {execution_time_ms:.3f} ms ")
+
+                        torch.cuda.synchronize()
+                        start_time = time.perf_counter() * 1000
+
+                        out = self.m(inputs, input_indices, output_shapes, output_indices)
+                        
+                        torch.cuda.synchronize()
+                        end_time = time.perf_counter() * 1000
+                        execution_time_ms = end_time - start_time
+                        print(f"cueq equi-linear forward cost: {execution_time_ms:.3f} ms")
+                        print(f"eq-linear input0 shape: {inputs[0].shape}, input1 shape: {inputs[1].shape}")
+                        print(f"eq-linear out shape:{out[0].shape}")
+                '''
+                if tuple(inputs[0].shape) == (1, 36864) :  # or tuple(inputs[0].shape) == (1, 163840) or tuple(inputs[0].shape) == (1, 852992)
                     ref = fast_equi_linear(self.descriptor, inputs[0], inputs[1])
                     out[0] = ref
                 else:
-                    return self.m(inputs, input_indices, output_shapes, output_indices)
+                    out = self.m(inputs, input_indices, output_shapes, output_indices)
+
+                    return out
             elif self.op_name == "stc":
                 i0 = input_indices[0].to(torch.int32)
                 x0 = inputs[0]
@@ -1003,6 +1103,15 @@ class FastEqSegmentedPolynomial(nn.Module):
                     self.num_out_segments,
                 )
                 out[0] = ref
+            elif self.op_name == "uniform1d":
+                w = inputs[0]
+                x = inputs[1]
+                y = inputs[2]
+                scatter_sum_dim = x.shape[0]
+                x_src = x[input_indices[1]]
+                ref = fast_uniform1d(w, x_src, y, self.u1d_meta)
+                ref = ref.view(x_src.shape[0], -1)
+                ref = scatter_sum(ref, output_indices[0], dim=0, dim_size=scatter_sum_dim).view(scatter_sum_dim, -1)
             elif self.op_name == "cwtp":
                 # mptp case use input and output indices
                 if input_indices.get(1) is not None and output_indices.get(0) is not None:
