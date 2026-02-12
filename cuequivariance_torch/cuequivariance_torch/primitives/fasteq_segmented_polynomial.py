@@ -917,7 +917,7 @@ class FastEqSegmentedPolynomial(nn.Module):
             self.meta = infer_fctp_meta(self.descriptor, math_dtype=math_dtype, device="cuda") # device hardcoded for now
         
         if use_fasteq and (op_name == "uniform1d"):
-            #print(f"op_name:{op_name}, desc:{self.descriptor}")
+            print(f"op_name:{op_name}, desc:{self.descriptor}")
             ds_ = [d for _, d in polynomial.operations]
             self.path_segment_indices = sum((d.indices.tolist() for  d in ds_), [])
             self.path_coefficients = sum((d.stacked_coefficients.tolist() for d in ds_), [])
@@ -927,21 +927,21 @@ class FastEqSegmentedPolynomial(nn.Module):
 
             path_segment_indices_tensor = torch.tensor(self.path_segment_indices, dtype=torch.int32, device="cuda")
             path_coefficients_tensor = torch.tensor(self.path_coefficients, dtype=math_dtype, device="cuda")
-            self.u_dim = list(self.descriptor.get_dims("u"))[0]
-            out_segment_num = self.num_segments_list[3]
-            self.i_list, self.j_list, self.k_list, self.coeff_list, self.v_offsets = build_grouped_paths(path_segment_indices_tensor, path_coefficients_tensor, out_segment_num, "cuda")
+            u_dim = list(self.descriptor.get_dims("u"))[0]
+            w_seg_num, x_seg_num, y_seg_num, out_seg_num = self.num_segments_list[0], self.num_segments_list[1], self.num_segments_list[2], self.num_segments_list[3]
+            i_list, j_list, k_list, coeff_list, v_offsets = build_grouped_paths(path_segment_indices_tensor, path_coefficients_tensor, out_seg_num, "cuda")
             self.u1d_meta = {}
 
-            self.u1d_meta["src_indices"] = meta["src_indices"]
-            self.u1d_meta["i_list"] = meta["i_list"]
-            self.u1d_meta["j_list"] = meta["j_list"]
-            self.u1d_meta["k_list"] = meta["k_list"]
-            self.u1d_meta["coeff_list"] = meta["coeff_list"]
-            self.u1d_meta["v_offsets"] = meta["v_offsets"]
-            self.u1d_meta["out_seg_num"] = meta["out_seg_num"]
-            self.u1d_meta["w_seg_num"] = meta["w_seg_num"]
-            self.u1d_meta["x_seg_num"] = meta["x_seg_num"]
-            self.u1d_meta["y_seg_num"] = meta["y_seg_num"]
+            self.u1d_meta["i_list"] = i_list
+            self.u1d_meta["j_list"] = j_list
+            self.u1d_meta["k_list"] = k_list
+            self.u1d_meta["coeff_list"] = coeff_list
+            self.u1d_meta["v_offsets"] = v_offsets
+            self.u1d_meta["out_seg_num"] = out_seg_num
+            self.u1d_meta["w_seg_num"] = w_seg_num
+            self.u1d_meta["x_seg_num"] = x_seg_num
+            self.u1d_meta["y_seg_num"] = y_seg_num
+            self.u1d_meta["u_dim"] = u_dim
 
 
     def __repr__(self):
@@ -1112,6 +1112,7 @@ class FastEqSegmentedPolynomial(nn.Module):
                 ref = fast_uniform1d(w, x_src, y, self.u1d_meta)
                 ref = ref.view(x_src.shape[0], -1)
                 ref = scatter_sum(ref, output_indices[0], dim=0, dim_size=scatter_sum_dim).view(scatter_sum_dim, -1)
+                out[0] = ref
             elif self.op_name == "cwtp":
                 # mptp case use input and output indices
                 if input_indices.get(1) is not None and output_indices.get(0) is not None:
