@@ -33,6 +33,48 @@ from cuequivariance_torch.primitives.segmented_polynomial_uniform_1d import (
 
 import cuequivariance as cue
 
+import time
+from mace.tools.scatter import scatter_sum
+
+def build_grouped_paths(path_segment_indices: torch.Tensor,
+                        path_coefficients: torch.Tensor,
+                        V: int,
+                        device=None):
+    """
+    path_segment_indices: [P,4] int64/int32, columns: i,j,k,v
+    path_coefficients:    [P]   float32/float64
+    returns:
+      i_list, j_list, k_list: [P] int32
+      coeff_list:             [P] same dtype as coefficients
+      v_offsets:              [V+1] int32, CSR-like offsets into lists
+    """
+    assert path_segment_indices.ndim == 2 and path_segment_indices.size(1) == 4
+    P = path_segment_indices.size(0)
+    if device is None:
+        device = path_segment_indices.device
+
+    psi = path_segment_indices.to("cpu")
+    coeff = path_coefficients.to("cpu")
+
+    v = psi[:, 3].to(torch.int64)
+    # sort by v
+    order = torch.argsort(v, stable=True)
+    psi_s = psi[order]
+    coeff_s = coeff[order]
+
+    v_s = psi_s[:, 3].to(torch.int64)
+    counts = torch.bincount(v_s, minlength=V)
+    v_offsets = torch.zeros(V + 1, dtype=torch.int32)
+    v_offsets[1:] = torch.cumsum(counts, dim=0).to(torch.int32)
+
+    i_list = psi_s[:, 0].to(torch.int32).contiguous().to(device)
+    j_list = psi_s[:, 1].to(torch.int32).contiguous().to(device)
+    k_list = psi_s[:, 2].to(torch.int32).contiguous().to(device)
+    coeff_list = coeff_s.contiguous().to(device)
+    v_offsets = v_offsets.contiguous().to(device)
+
+    return i_list, j_list, k_list, coeff_list, v_offsets
+
 try:
     import cuequivariance_ops_torch  # noqa: F401
 
@@ -151,6 +193,29 @@ class SegmentedPolynomial(nn.Module):
         self.method = method
         self.repr = polynomial.__repr__()
         self.op_name = op_name
+
+        self.descriptor = polynomial.operations[0][1]
+
+        
+        
+        if op_name == "cwtp":
+            #print(f"op_name:{op_name}, desc:{self.descriptor}")
+            ds_ = [d for _, d in polynomial.operations]
+            self.path_segment_indices = sum((d.indices.tolist() for  d in ds_), [])
+            self.path_coefficients = sum((d.stacked_coefficients.tolist() for d in ds_), [])
+            self.num_segments_list = [ operand.num_segments for operand in self.descriptor.operands]
+            #print(f"path_segment_indices len:{len(self.path_segment_indices)}, {self.path_segment_indices}")
+            #print(f"len:{len(self.path_coefficients)}, path_coefficients:{self.path_coefficients}")
+
+            path_segment_indices_tensor = torch.tensor(self.path_segment_indices, dtype=torch.int32, device="cuda")
+            path_coefficients_tensor = torch.tensor(self.path_coefficients, dtype=math_dtype, device="cuda")
+
+            self.u_dim = list(self.descriptor.get_dims("u"))[0]
+            
+            #print(f"u dim: {self.u_dim}, num_segments_list: {self.num_segments_list}")
+            out_segment_num = self.num_segments_list[3]
+            self.i_list, self.j_list, self.k_list, self.coeff_list, self.v_offsets = build_grouped_paths(path_segment_indices_tensor, path_coefficients_tensor, out_segment_num, "cuda")
+           
         
         if method == "":
             warnings.warn(
@@ -305,4 +370,75 @@ class SegmentedPolynomial(nn.Module):
                     return self.fallback(
                         inputs, input_indices, output_shapes, output_indices
                     )
-        return self.m(inputs, input_indices, output_shapes, output_indices)
+
+        out = self.m(inputs, input_indices, output_shapes, output_indices)
+        
+        '''
+        # for uniform_1d cwtp, in 7net is u,u,,u
+        if self.op_name == "cwtp":
+            print(f"desc:{self.descriptor}")
+            #print(f"cwtp input size:{len(inputs)}")
+            #print(f"input_indices shape:{input_indices[1].shape}")
+            #print(f"output_indices shape:{output_indices[0].shape}")
+            #print(f"cwtp input0 shape: {inputs[0].shape}, input1 shape: {inputs[1].shape}, input2 shape: {inputs[2].shape}")
+            #print(f"cwtp out shape:{out[0].shape}")
+
+           # 
+            w_seg_num, x_seg_num, y_seg_num, out_seg_num = self.num_segments_list[0], self.num_segments_list[1], self.num_segments_list[2], self.num_segments_list[3]
+            w = inputs[0].view(-1, w_seg_num, self.u_dim)
+            x = inputs[1].view(-1, x_seg_num, self.u_dim)
+            y = inputs[2].view(-1, y_seg_num, 1)
+
+            scatter_sum_dim = x.shape[0]
+
+            x_src = x[input_indices[1]]
+
+
+            # ============ torch implement ===============
+            #torch.cuda.synchronize()
+            #start_time = time.perf_counter() * 1000
+
+            #ref = torch.zeros((x_src.shape[0], out_seg_num, self.u_dim), device=x.device, dtype=x.dtype)
+            #for pid, psi in  enumerate(self.path_segment_indices):
+            #    i,j,k,v = psi # for w, x, y, out
+            #    w_seg = w[:, i, :] # # w_seg shape: [1694, U]
+            #    x_seg = x_src[:, j, :] # x_seg shape: [1694, U]
+            #    y_seg = y[:, k, :] # y_seg shape: [1694, 1]
+                 
+            #    out_seg = x_seg * y_seg * w_seg * self.path_coefficients[pid]  # out shape: [1694, U]
+            #    ref[:, v, :] += out_seg
+            
+            #torch.cuda.synchronize()
+            #end_time = time.perf_counter() * 1000
+            #execution_time_ms = end_time - start_time
+            #print(f"my torch op:{self.op_name} forward cost: {execution_time_ms:.3f} ms")
+
+
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
+
+            ref = torch.ops.cwtp_fwd.forward_u1d(w, x_src, y, self.i_list, self.j_list, self.k_list, self.coeff_list, self.v_offsets, out_seg_num)
+
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"my cuda op:{self.op_name} forward cost: {execution_time_ms:.3f} ms")
+            
+            ref = ref.view(x_src.shape[0], -1)
+            ref = scatter_sum(ref, output_indices[0], dim=0, dim_size=scatter_sum_dim).view(scatter_sum_dim, -1)
+
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"my cuda op:{self.op_name} + scatter_sum cost: {execution_time_ms:.3f} ms")
+
+            
+            atol = 1e-6
+            rtol = 1e-5
+            mask = (ref - out[0]).abs() > (atol + rtol * out[0].abs())
+            ratio = mask.double().mean().item()
+            max_diff = (ref - out[0]).abs().max().item()
+            print(f"ref and out diff ratio:{ratio}, max_diff:{max_diff}")
+        '''
+
+        return out

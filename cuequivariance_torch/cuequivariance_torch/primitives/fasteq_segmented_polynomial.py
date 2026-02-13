@@ -49,6 +49,7 @@ from fasteq.ops.stc import fast_stc
 from fasteq.ops.cwtp import fast_cwtp
 from fasteq.ops.mptp import fast_mptp
 from fasteq.ops.fctp import fast_fctp
+from fasteq.ops.uniform1d_fused import fast_uniform1d_fused
 from fasteq.ops.uniform1d import fast_uniform1d
 
 @torch.no_grad()
@@ -309,7 +310,7 @@ def infer_cwtp_meta(
     }
     return meta
 
-
+@torch.no_grad()
 def build_grouped_paths(path_segment_indices: torch.Tensor,
                         path_coefficients: torch.Tensor,
                         V: int,
@@ -348,6 +349,24 @@ def build_grouped_paths(path_segment_indices: torch.Tensor,
     v_offsets = v_offsets.contiguous().to(device)
 
     return i_list, j_list, k_list, coeff_list, v_offsets
+
+@torch.no_grad()
+def build_csr_buckets(cls_idx: torch.Tensor, S: int):
+    """
+    cls_idx: [B] int32/int64, on CUDA, values in [0..S-1]
+    returns:
+      b_list: [B] int32 CUDA
+      cls_offsets: [S+1] int32 CUDA
+    """
+    assert cls_idx.is_cuda
+    order = torch.argsort(cls_idx.to(torch.int64), stable=True)   # [B]
+    b_list = order.to(torch.int32)
+
+    counts = torch.bincount(cls_idx.to(torch.int64), minlength=S) # [S] on CUDA
+    cls_offsets = torch.empty(S + 1, device=cls_idx.device, dtype=torch.int32)
+    cls_offsets[0] = 0
+    cls_offsets[1:] = torch.cumsum(counts, dim=0).to(torch.int32)
+    return b_list, cls_offsets
 
 @torch.no_grad()
 def build_k_sliced_ell_packed(
@@ -1104,14 +1123,23 @@ class FastEqSegmentedPolynomial(nn.Module):
                 )
                 out[0] = ref
             elif self.op_name == "uniform1d":
+                
                 w = inputs[0]
                 x = inputs[1]
                 y = inputs[2]
                 scatter_sum_dim = x.shape[0]
+                
+
+                b_list, cls_offsets = build_csr_buckets(output_indices[0], scatter_sum_dim)
+                ref = fast_uniform1d_fused(w, x, y, input_indices[1], b_list, cls_offsets, self.u1d_meta)
+                ref = ref.view(scatter_sum_dim, -1)
+
+                '''
                 x_src = x[input_indices[1]]
                 ref = fast_uniform1d(w, x_src, y, self.u1d_meta)
                 ref = ref.view(x_src.shape[0], -1)
                 ref = scatter_sum(ref, output_indices[0], dim=0, dim_size=scatter_sum_dim).view(scatter_sum_dim, -1)
+                '''
                 out[0] = ref
             elif self.op_name == "cwtp":
                 # mptp case use input and output indices
