@@ -50,7 +50,44 @@ from fasteq.ops.cwtp import fast_cwtp
 from fasteq.ops.mptp import fast_mptp
 from fasteq.ops.fctp import fast_fctp
 from fasteq.ops.uniform1d_fused import fast_uniform1d_fused
-from fasteq.ops.uniform1d import fast_uniform1d
+
+import math
+from torch.nn.utils.rnn import pad_sequence
+
+def flatten_stp(d: cue.SegmentedTensorProduct) -> cue.SegmentedTensorProduct:
+    
+
+    d = d.move_operand(0, -2)
+    d = d.flatten_coefficient_modes(force=True)
+    d = d.flatten_modes(
+        [
+            m
+            for m in d.subscripts.modes()
+            if not all(m in ss for ss in d.subscripts.operands)
+        ]
+    )
+    d = d.consolidate_modes()
+    if d.subscripts.modes() == []:
+        d = d.append_modes_to_all_operands("u", dict(u=1))
+    '''
+    for oid in range(0, d.num_operands - 2):
+        print(f"oid:{oid}, len d.operands[oid].num_segments:{d.operands[oid].num_segments}")
+    '''
+
+    # ops.SymmetricTensorContraction will "symmetrize" for the derivatives so we can sort for the forward pass
+    d = d.sort_indices_for_identical_operands(range(0, d.num_operands - 2))
+
+    if len(d.subscripts.modes()) != 1:
+        raise NotImplementedError("Different modes are not supported.")
+
+    m = d.subscripts.modes()[0]
+
+    if not all(ss == m for ss in d.subscripts.operands):
+        raise NotImplementedError("Different subscripts are not supported.")
+
+    d = d.split_mode(m, math.gcd(*d.get_dims(m)))
+
+    return d
 
 @torch.no_grad()
 def infer_cwtp_meta(
@@ -345,10 +382,11 @@ def build_grouped_paths(path_segment_indices: torch.Tensor,
     i_list = psi_s[:, 0].to(torch.int32).contiguous().to(device)
     j_list = psi_s[:, 1].to(torch.int32).contiguous().to(device)
     k_list = psi_s[:, 2].to(torch.int32).contiguous().to(device)
+    v_list = psi_s[:, 3].to(torch.int32).contiguous().to(device)
     coeff_list = coeff_s.contiguous().to(device)
     v_offsets = v_offsets.contiguous().to(device)
 
-    return i_list, j_list, k_list, coeff_list, v_offsets
+    return i_list, j_list, k_list, v_list, coeff_list, v_offsets
 
 @torch.no_grad()
 def build_csr_buckets(cls_idx: torch.Tensor, S: int):
@@ -775,6 +813,7 @@ class FastEqSegmentedPolynomial(nn.Module):
         name: str = "segmented_polynomial",
         op_name: str = "",
         use_fasteq: Optional[bool] = None,
+        u1d_compatible: bool = False,
     ):
         super().__init__()
 
@@ -786,6 +825,7 @@ class FastEqSegmentedPolynomial(nn.Module):
         self.descriptor = polynomial.operations[0][1]
         self.use_fasteq = use_fasteq
         self.polynomial = polynomial
+        self.u1d_compatible = u1d_compatible
         
         if method == "":
             warnings.warn(
@@ -838,53 +878,18 @@ class FastEqSegmentedPolynomial(nn.Module):
         else:
             raise ValueError(f"Invalid method: {method}")
 
-        print(f"Init op:{op_name}")
+        print(f"Init op:{op_name}, u1d_compatible:{u1d_compatible}, use_fasteq:{use_fasteq}")
 
-        if use_fasteq and op_name == "stc":
-            import math
-            from torch.nn.utils.rnn import pad_sequence
-            def f(d: cue.SegmentedTensorProduct) -> cue.SegmentedTensorProduct:
-                
-
-                d = d.move_operand(0, -2)
-                d = d.flatten_coefficient_modes(force=True)
-                d = d.flatten_modes(
-                    [
-                        m
-                        for m in d.subscripts.modes()
-                        if not all(m in ss for ss in d.subscripts.operands)
-                    ]
-                )
-                d = d.consolidate_modes()
-                if d.subscripts.modes() == []:
-                    d = d.append_modes_to_all_operands("u", dict(u=1))
-                '''
-                for oid in range(0, d.num_operands - 2):
-                    print(f"oid:{oid}, len d.operands[oid].num_segments:{d.operands[oid].num_segments}")
-                '''
-
-                # ops.SymmetricTensorContraction will "symmetrize" for the derivatives so we can sort for the forward pass
-                d = d.sort_indices_for_identical_operands(range(0, d.num_operands - 2))
-
-                if len(d.subscripts.modes()) != 1:
-                    raise NotImplementedError("Different modes are not supported.")
-
-                m = d.subscripts.modes()[0]
-
-                if not all(ss == m for ss in d.subscripts.operands):
-                    raise NotImplementedError("Different subscripts are not supported.")
-
-                d = d.split_mode(m, math.gcd(*d.get_dims(m)))
-
-                return d
-
-            ds_ = [f(d) for _, d in polynomial.operations]
+        if use_fasteq and (op_name == "stc"):
+            ds_ = [flatten_stp(d) for _, d in polynomial.operations]
             d_max = max(ds_, key=lambda d: d.num_operands)
             self.num_out_segments = d_max.operands[-1].num_segments
             self.u = d_max.operands[0].size // d_max.operands[0].num_segments
 
             path_segment_indices = sum((d.indices.tolist() for  d in ds_), [])
             path_coefficients = sum((d.stacked_coefficients.tolist() for d in ds_), [])
+
+            print(f"op_name:{op_name}, desc:{self.descriptor}")
 
             device = "cuda" # TODO: make it general
             self.coeffs_tensor = torch.as_tensor(path_coefficients, dtype=math_dtype).to(device)
@@ -894,7 +899,7 @@ class FastEqSegmentedPolynomial(nn.Module):
                 batch_first=True, padding_value=0
             ).to(device)
         
-        if use_fasteq and (op_name == "cwtp"):
+        elif use_fasteq and op_name == "cwtp" and not u1d_compatible:
             self.meta = infer_cwtp_meta(self.descriptor, math_dtype=math_dtype, device="cuda") # device hardcoded for now
             cg_i_groupk = self.meta["cg_i_all"]
             cg_j_groupk  = self.meta["cg_j_all"]
@@ -931,29 +936,30 @@ class FastEqSegmentedPolynomial(nn.Module):
             self.ell_meta["meta1"] = meta1
             self.ell_meta["meta2"] = meta2
 
-        
-        if use_fasteq and (op_name == "fctp"):
-            self.meta = infer_fctp_meta(self.descriptor, math_dtype=math_dtype, device="cuda") # device hardcoded for now
-        
-        if use_fasteq and (op_name == "uniform1d"):
-            print(f"op_name:{op_name}, desc:{self.descriptor}")
-            ds_ = [d for _, d in polynomial.operations]
-            self.path_segment_indices = sum((d.indices.tolist() for  d in ds_), [])
+        elif use_fasteq and ((op_name == "cwtp" and u1d_compatible) or (op_name == "uniform1d")):
+
+            self.descriptor = self.m.polynomial.operations[0][1]
+            print(f"cwtp u1d compatible path, descriptor:{self.descriptor}")
+            print(f"polynomial.operations:{self.m.polynomial.operations}")
+
+            ds_ = [d for _, d in self.m.polynomial.operations]
+            self.path_indices = sum((d.indices.tolist() for  d in ds_), [])
             self.path_coefficients = sum((d.stacked_coefficients.tolist() for d in ds_), [])
             self.num_segments_list = [ operand.num_segments for operand in self.descriptor.operands]
             #print(f"path_segment_indices len:{len(self.path_segment_indices)}, {self.path_segment_indices}")
             #print(f"len:{len(self.path_coefficients)}, path_coefficients:{self.path_coefficients}")
 
-            path_segment_indices_tensor = torch.tensor(self.path_segment_indices, dtype=torch.int32, device="cuda")
+            path_segment_indices_tensor = torch.tensor(self.path_indices, dtype=torch.int32, device="cuda")
             path_coefficients_tensor = torch.tensor(self.path_coefficients, dtype=math_dtype, device="cuda")
             u_dim = list(self.descriptor.get_dims("u"))[0]
             w_seg_num, x_seg_num, y_seg_num, out_seg_num = self.num_segments_list[0], self.num_segments_list[1], self.num_segments_list[2], self.num_segments_list[3]
-            i_list, j_list, k_list, coeff_list, v_offsets = build_grouped_paths(path_segment_indices_tensor, path_coefficients_tensor, out_seg_num, "cuda")
+            i_list, j_list, k_list, v_list, coeff_list, v_offsets = build_grouped_paths(path_segment_indices_tensor, path_coefficients_tensor, out_seg_num, "cuda")
             self.u1d_meta = {}
 
             self.u1d_meta["i_list"] = i_list
             self.u1d_meta["j_list"] = j_list
             self.u1d_meta["k_list"] = k_list
+            self.u1d_meta["v_list"] = v_list
             self.u1d_meta["coeff_list"] = coeff_list
             self.u1d_meta["v_offsets"] = v_offsets
             self.u1d_meta["out_seg_num"] = out_seg_num
@@ -961,6 +967,10 @@ class FastEqSegmentedPolynomial(nn.Module):
             self.u1d_meta["x_seg_num"] = x_seg_num
             self.u1d_meta["y_seg_num"] = y_seg_num
             self.u1d_meta["u_dim"] = u_dim
+        
+        elif use_fasteq and (op_name == "fctp"):
+            self.meta = infer_fctp_meta(self.descriptor, math_dtype=math_dtype, device="cuda")
+            
 
 
     def __repr__(self):
@@ -1122,16 +1132,30 @@ class FastEqSegmentedPolynomial(nn.Module):
                     self.num_out_segments,
                 )
                 out[0] = ref
-            elif self.op_name == "uniform1d":
+            elif self.op_name == "uniform1d" or (self.op_name == "cwtp" and self.u1d_compatible):
                 
                 w = inputs[0]
                 x = inputs[1]
                 y = inputs[2]
                 scatter_sum_dim = x.shape[0]
-                
 
+                '''
+                print(f"input:{input_indices[1]}")
+                print(f"output:{output_indices[0]}")
+
+                perm = torch.argsort(input_indices[1])
+                input_sorted = input_indices[1][perm]
+                out_sorted   = output_indices[0][perm]
+                print(f"input sorted:{input_sorted}")
+                print(f"output sorted:{out_sorted}")
+
+                ib_list, icls_offsets = build_csr_buckets(input_indices[1], scatter_sum_dim)
+                print(f"input sort b_list:{ib_list}")
+                '''
+                
                 b_list, cls_offsets = build_csr_buckets(output_indices[0], scatter_sum_dim)
-                ref = fast_uniform1d_fused(w, x, y, input_indices[1], b_list, cls_offsets, self.u1d_meta)
+
+                ref = fast_uniform1d_fused(w, x, y, input_indices[1], output_indices[0], b_list, cls_offsets, self.u1d_meta)
                 ref = ref.view(scatter_sum_dim, -1)
 
                 '''

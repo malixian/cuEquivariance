@@ -171,7 +171,8 @@ class ChannelWiseTensorProduct(torch.nn.Module):
                     "You can consider making the segments uniform in the descriptor."
                 )
             self.method = method
-        
+
+        print(f"fasteq init cwtp method:{self.method}, u1d_compatible:{u1d_compatible}")
         self.use_fasteq = use_fasteq
         if use_fasteq:
             self.ff = cuet.FastEqSegmentedPolynomial(
@@ -180,6 +181,7 @@ class ChannelWiseTensorProduct(torch.nn.Module):
                 math_dtype=math_dtype,
                 use_fasteq=use_fasteq,
                 op_name="cwtp", # channel-wise tensor product
+                u1d_compatible=u1d_compatible,
             ).to(device)
 
         self.f = cuet.SegmentedPolynomial(
@@ -187,6 +189,8 @@ class ChannelWiseTensorProduct(torch.nn.Module):
             method=self.method,
             math_dtype=math_dtype,
         ).to(device)
+
+        self.descriptor = e.polynomial.operations[0][1]
 
     @torch.jit.ignore
     def extra_repr(self) -> str:
@@ -276,8 +280,12 @@ class ChannelWiseTensorProduct(torch.nn.Module):
             #execution_time_ms = end_time - start_time
             #print(f"<< fasteq cwtp forward cost: {execution_time_ms:.3f} ms >>")
         else:
-            #torch.cuda.synchronize()
-            #start_time = time.perf_counter() * 1000
+            
+            print(f"cueq cwtp descriptor:{self}")
+            print(f"weight shape:{weight.shape}, x1 shape:{x1.shape}, x2 shape:{x2.shape}")
+            
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
 
             output = self.f(
                 [weight, x1, x2],
@@ -286,8 +294,8 @@ class ChannelWiseTensorProduct(torch.nn.Module):
                 output_indices=indices_out,
             )
 
-            #torch.cuda.synchronize()
-            #end_time = time.perf_counter() * 1000
-            #execution_time_ms = end_time - start_time
-            #print(f"<< cueq cwtp forward cost: {execution_time_ms:.3f} ms >>")
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"<< cueq cwtp forward cost: {execution_time_ms:.3f} ms >>")
         return self.transpose_out(output[0])

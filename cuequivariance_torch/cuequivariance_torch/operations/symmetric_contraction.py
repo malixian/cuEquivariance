@@ -263,7 +263,7 @@ class SymmetricContraction(torch.nn.Module):
         Returns:
             torch.Tensor: The output tensor. It has shape (batch, irreps_out.dim).
         """
-        print(f"STC weight shape: {self.weight.shape}, x shape: {x.shape}, indices shape: {indices.shape}")
+        #print(f"STC weight shape: {self.weight.shape}, x shape: {x.shape}, indices shape: {indices.shape}")
 
         if self.use_fasteq:
 

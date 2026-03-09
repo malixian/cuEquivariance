@@ -372,7 +372,6 @@ class SegmentedPolynomial(nn.Module):
                     )
 
         out = self.m(inputs, input_indices, output_shapes, output_indices)
-        
         '''
         # for uniform_1d cwtp, in 7net is u,u,,u
         if self.op_name == "cwtp":
@@ -422,7 +421,9 @@ class SegmentedPolynomial(nn.Module):
             torch.cuda.synchronize()
             end_time = time.perf_counter() * 1000
             execution_time_ms = end_time - start_time
-            print(f"my cuda op:{self.op_name} forward cost: {execution_time_ms:.3f} ms")
+            print(f"my forward_u1d no fused op:{self.op_name} forward cost: {execution_time_ms:.3f} ms")
+
+        
             
             ref = ref.view(x_src.shape[0], -1)
             ref = scatter_sum(ref, output_indices[0], dim=0, dim_size=scatter_sum_dim).view(scatter_sum_dim, -1)
@@ -439,6 +440,7 @@ class SegmentedPolynomial(nn.Module):
             ratio = mask.double().mean().item()
             max_diff = (ref - out[0]).abs().max().item()
             print(f"ref and out diff ratio:{ratio}, max_diff:{max_diff}")
+
         '''
 
         return out
