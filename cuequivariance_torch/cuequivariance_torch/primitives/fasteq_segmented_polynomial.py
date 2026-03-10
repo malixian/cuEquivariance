@@ -723,6 +723,8 @@ class FastEqSegmentedPolynomial(nn.Module):
         self.descriptor = polynomial.operations[0][1]
         self.use_fasteq = use_fasteq
         self.polynomial = polynomial
+
+        print(f"fasteq :{use_fasteq}, op_name:{op_name}")
         
         if method == "":
             warnings.warn(
@@ -746,9 +748,9 @@ class FastEqSegmentedPolynomial(nn.Module):
 
         if method != "naive" and not HAS_CUE_OPS:
             method = "naive"
-            warnings.warn(
-                "cuequivariance_ops_torch is not available. Falling back to naive implementation."
-            )
+            #warnings.warn(
+            #    "cuequivariance_ops_torch is not available. Falling back to naive implementation."
+            #)
 
         if method == "uniform_1d":
             self.m = SegmentedPolynomialFromUniform1dJit(
@@ -833,10 +835,10 @@ class FastEqSegmentedPolynomial(nn.Module):
             # for hip mptp
             operand_extent = 1
             o = polynomial.operands[0]
-            print(f"o.ndim:{o.ndim}, o.segment_shape:{o.segment_shape}")
+            #print(f"o.ndim:{o.ndim}, o.segment_shape:{o.segment_shape}")
             operand_extent = o.segment_shape[0]
-            self.buffer_num_segments = [len(o.segments) for o in polynomial.operands]
-            self.operand_extent = operand_extent
+            self.m.buffer_num_segments = [len(o.segments) for o in polynomial.operands]
+            self.m.operand_extent = operand_extent
 
             self.meta = infer_cwtp_meta(self.descriptor, math_dtype=math_dtype, device="cuda") # device hardcoded for now
             cg_i_groupk = self.meta["cg_i_all"]
