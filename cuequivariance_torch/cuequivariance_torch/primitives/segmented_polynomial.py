@@ -34,7 +34,7 @@ from cuequivariance_torch.primitives.segmented_polynomial_uniform_1d import (
 import cuequivariance as cue
 
 import time
-from mace.tools.scatter import scatter_sum
+#from mace.tools.scatter import scatter_sum
 
 def build_grouped_paths(path_segment_indices: torch.Tensor,
                         path_coefficients: torch.Tensor,

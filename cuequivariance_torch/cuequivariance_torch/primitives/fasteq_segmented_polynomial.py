@@ -42,7 +42,7 @@ except ImportError:
     HAS_CUE_OPS = False
 
 import time
-from mace.tools.scatter import scatter_sum
+#from mace.tools.scatter import scatter_sum
 
 from fasteq.ops.equi_linear import fast_equi_linear
 from fasteq.ops.stc import fast_stc
