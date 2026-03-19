@@ -50,6 +50,7 @@ from fasteq.ops.cwtp import fast_cwtp
 from fasteq.ops.mptp import fast_mptp
 from fasteq.ops.fctp import fast_fctp
 from fasteq.ops.uniform1d_fused import fast_uniform1d_fused
+from fasteq.ops.uniform1d_jit import fast_uniform1d_jit
 
 import math
 from torch.nn.utils.rnn import pad_sequence
@@ -1155,7 +1156,8 @@ class FastEqSegmentedPolynomial(nn.Module):
                 
                 b_list, cls_offsets = build_csr_buckets(output_indices[0], scatter_sum_dim)
 
-                ref = fast_uniform1d_fused(w, x, y, input_indices[1], output_indices[0], b_list, cls_offsets, self.u1d_meta)
+                #ref = fast_uniform1d_fused(w, x, y, input_indices[1], output_indices[0], b_list, cls_offsets, self.u1d_meta)
+                ref = fast_uniform1d_jit(w, x, y, input_indices[1], output_indices[0], b_list, self.u1d_meta)
                 ref = ref.view(scatter_sum_dim, -1)
 
                 '''
