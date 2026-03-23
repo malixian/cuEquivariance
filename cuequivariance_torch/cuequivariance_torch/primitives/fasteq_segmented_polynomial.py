@@ -49,7 +49,6 @@ from fasteq.ops.stc import fast_stc
 from fasteq.ops.cwtp import fast_cwtp
 from fasteq.ops.mptp import fast_mptp
 from fasteq.ops.fctp import fast_fctp
-from fasteq.ops.uniform1d_fused import fast_uniform1d_fused
 from fasteq.ops.uniform1d_jit import fast_uniform1d_jit
 
 import math
@@ -710,6 +709,7 @@ def infer_fctp_meta(descriptor, math_dtype, device):
         "p_for_k": p_for_k
     }
 
+@torch._dynamo.disable
 class FastEqSegmentedPolynomial(nn.Module):
     """PyTorch module that computes a segmented polynomial.
 
@@ -1153,11 +1153,16 @@ class FastEqSegmentedPolynomial(nn.Module):
                 ib_list, icls_offsets = build_csr_buckets(input_indices[1], scatter_sum_dim)
                 print(f"input sort b_list:{ib_list}")
                 '''
-                
-                b_list, cls_offsets = build_csr_buckets(output_indices[0], scatter_sum_dim)
 
-                #ref = fast_uniform1d_fused(w, x, y, input_indices[1], output_indices[0], b_list, cls_offsets, self.u1d_meta)
-                ref = fast_uniform1d_jit(w, x, y, input_indices[1], output_indices[0], b_list, self.u1d_meta)
+                fused_scatter = True
+                if len(output_indices) != 0:
+                    b_list, _ = build_csr_buckets(output_indices[0], scatter_sum_dim)
+                    ref = fast_uniform1d_jit(w, x, y, input_indices[1], output_indices[0], b_list, self.u1d_meta, fused_scatter)
+                else:
+                    fused_scatter = False
+                    ref = fast_uniform1d_jit(w, x, y, input_indices[2], output_indices, input_indices[2], self.u1d_meta, fused_scatter)
+
+                
                 ref = ref.view(scatter_sum_dim, -1)
 
                 '''

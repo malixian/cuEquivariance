@@ -196,6 +196,8 @@ class SegmentedPolynomial(nn.Module):
 
         self.descriptor = polynomial.operations[0][1]
 
+        print(f"<<<<<<< call cuet op_name:{op_name} >>>>>>>>>>>")
+
         
         
         if op_name == "cwtp":
@@ -284,6 +286,9 @@ class SegmentedPolynomial(nn.Module):
         output_shapes: Optional[Dict[int, torch.Tensor]] = None,
         output_indices: Optional[Dict[int, torch.Tensor]] = None,
     ):
+        
+        print(f"<<<<<<< forward cuet op_name:{self.op_name} >>>>>>>>>>>")
+        
         """Compute the segmented polynomial based on the specified descriptor.
 
         Args:
@@ -370,8 +375,8 @@ class SegmentedPolynomial(nn.Module):
                     return self.fallback(
                         inputs, input_indices, output_shapes, output_indices
                     )
-
         out = self.m(inputs, input_indices, output_shapes, output_indices)
+        print(f"cueq uniform1d input0 shape: {inputs[0].shape}, input1 shape: {inputs[1].shape}, input2 shape: {inputs[2].shape}")
         '''
         # for uniform_1d cwtp, in 7net is u,u,,u
         if self.op_name == "cwtp":
