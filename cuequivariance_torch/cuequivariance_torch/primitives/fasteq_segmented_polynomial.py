@@ -389,6 +389,73 @@ def build_grouped_paths(path_segment_indices: torch.Tensor,
     return i_list, j_list, k_list, v_list, coeff_list, v_offsets
 
 @torch.no_grad()
+def build_grouped_paths_as_buffers(
+    module: nn.Module,
+    path_segment_indices: torch.Tensor,
+    path_coefficients: torch.Tensor,
+    V: int,
+    *,
+    prefix: str = "",
+    device=None,
+    persistent: bool = True,
+):
+    """
+    Build grouped path metadata and register them as buffers on `module`.
+
+    Args:
+        module: target nn.Module
+        path_segment_indices: [P, 4], columns are (i, j, k, v)
+        path_coefficients:    [P]
+        V: number of output groups for CSR-like offsets
+        prefix: optional buffer name prefix, e.g. "fwd_"
+        device: target device; default is path_segment_indices.device
+        persistent: whether buffers are saved in state_dict
+
+    Registered buffers:
+        {prefix}i_list      : [P] int32
+        {prefix}j_list      : [P] int32
+        {prefix}k_list      : [P] int32
+        {prefix}v_list      : [P] int32
+        {prefix}coeff_list  : [P] same dtype as path_coefficients
+        {prefix}v_offsets   : [V+1] int32
+    """
+    assert path_segment_indices.ndim == 2 and path_segment_indices.size(1) == 4, \
+        "path_segment_indices must have shape [P, 4]"
+
+    if device is None:
+        device = path_segment_indices.device
+
+    psi = path_segment_indices.detach().to("cpu")
+    coeff = path_coefficients.detach().to("cpu")
+
+    # Sort by v
+    v = psi[:, 3].to(torch.int64)
+    order = torch.argsort(v, stable=True)
+    psi_s = psi.index_select(0, order)
+    coeff_s = coeff.index_select(0, order)
+
+    # Build CSR-like offsets for v
+    v_s = psi_s[:, 3].to(torch.int64)
+    counts = torch.bincount(v_s, minlength=V)
+
+    v_offsets = torch.zeros(V + 1, dtype=torch.int32)
+    v_offsets[1:] = torch.cumsum(counts, dim=0).to(torch.int32)
+
+    i_list = psi_s[:, 0].to(torch.int32).contiguous().to(device)
+    j_list = psi_s[:, 1].to(torch.int32).contiguous().to(device)
+    k_list = psi_s[:, 2].to(torch.int32).contiguous().to(device)
+    v_list = psi_s[:, 3].to(torch.int32).contiguous().to(device)
+    coeff_list = coeff_s.contiguous().to(device)
+    v_offsets = v_offsets.contiguous().to(device)
+
+    module.register_buffer(f"{prefix}i_list", i_list, persistent=persistent)
+    module.register_buffer(f"{prefix}j_list", j_list, persistent=persistent)
+    module.register_buffer(f"{prefix}k_list", k_list, persistent=persistent)
+    module.register_buffer(f"{prefix}v_list", v_list, persistent=persistent)
+    module.register_buffer(f"{prefix}coeff_list", coeff_list, persistent=persistent)
+    module.register_buffer(f"{prefix}v_offsets", v_offsets, persistent=persistent)
+
+@torch.no_grad()
 def build_csr_buckets(cls_idx: torch.Tensor, S: int):
     """
     cls_idx: [B] int32/int64, on CUDA, values in [0..S-1]
@@ -879,7 +946,7 @@ class FastEqSegmentedPolynomial(nn.Module):
         else:
             raise ValueError(f"Invalid method: {method}")
 
-        print(f"Init op:{op_name}, u1d_compatible:{u1d_compatible}, use_fasteq:{use_fasteq}")
+        print(f"Init op:{op_name}, u1d_compatible:{u1d_compatible}, use_fasteq:{use_fasteq}, self.descriptor:{self.descriptor}")
 
         if use_fasteq and (op_name == "stc"):
             ds_ = [flatten_stp(d) for _, d in polynomial.operations]
@@ -947,6 +1014,7 @@ class FastEqSegmentedPolynomial(nn.Module):
             self.path_indices = sum((d.indices.tolist() for  d in ds_), [])
             self.path_coefficients = sum((d.stacked_coefficients.tolist() for d in ds_), [])
             self.num_segments_list = [ operand.num_segments for operand in self.descriptor.operands]
+            self.size_list = [ operand.size for operand in self.descriptor.operands]
             #print(f"path_segment_indices len:{len(self.path_segment_indices)}, {self.path_segment_indices}")
             #print(f"len:{len(self.path_coefficients)}, path_coefficients:{self.path_coefficients}")
 
@@ -954,20 +1022,23 @@ class FastEqSegmentedPolynomial(nn.Module):
             path_coefficients_tensor = torch.tensor(self.path_coefficients, dtype=math_dtype, device="cuda")
             u_dim = list(self.descriptor.get_dims("u"))[0]
             w_seg_num, x_seg_num, y_seg_num, out_seg_num = self.num_segments_list[0], self.num_segments_list[1], self.num_segments_list[2], self.num_segments_list[3]
-            i_list, j_list, k_list, v_list, coeff_list, v_offsets = build_grouped_paths(path_segment_indices_tensor, path_coefficients_tensor, out_seg_num, "cuda")
+            #i_list, j_list, k_list, v_list, coeff_list, v_offsets = build_grouped_paths(path_segment_indices_tensor, path_coefficients_tensor, out_seg_num, "cuda")
+            build_grouped_paths_as_buffers(self, path_segment_indices_tensor, path_coefficients_tensor, out_seg_num, device="cuda", persistent=False)
             self.u1d_meta = {}
 
-            self.u1d_meta["i_list"] = i_list
-            self.u1d_meta["j_list"] = j_list
-            self.u1d_meta["k_list"] = k_list
-            self.u1d_meta["v_list"] = v_list
-            self.u1d_meta["coeff_list"] = coeff_list
-            self.u1d_meta["v_offsets"] = v_offsets
+            self.u1d_meta["i_list"] = self.i_list
+            self.u1d_meta["j_list"] = self.j_list
+            self.u1d_meta["k_list"] = self.k_list
+            self.u1d_meta["v_list"] = self.v_list
+            self.u1d_meta["coeff_list"] = self.coeff_list
+            self.u1d_meta["size_list"] = self.size_list
+            self.u1d_meta["v_offsets"] = self.v_offsets
             self.u1d_meta["out_seg_num"] = out_seg_num
             self.u1d_meta["w_seg_num"] = w_seg_num
             self.u1d_meta["x_seg_num"] = x_seg_num
             self.u1d_meta["y_seg_num"] = y_seg_num
             self.u1d_meta["u_dim"] = u_dim
+            
         
         elif use_fasteq and (op_name == "fctp"):
             self.meta = infer_fctp_meta(self.descriptor, math_dtype=math_dtype, device="cuda")
@@ -1108,7 +1179,7 @@ class FastEqSegmentedPolynomial(nn.Module):
                         print(f"eq-linear input0 shape: {inputs[0].shape}, input1 shape: {inputs[1].shape}")
                         print(f"eq-linear out shape:{out[0].shape}")
                 '''
-                if tuple(inputs[0].shape) == (1, 36864) :  # or tuple(inputs[0].shape) == (1, 163840) or tuple(inputs[0].shape) == (1, 852992)
+                if tuple(inputs[0].shape) == (1, 36864) or tuple(inputs[0].shape) == (1, 163840) or tuple(inputs[0].shape) == (1, 852992):
                     ref = fast_equi_linear(self.descriptor, inputs[0], inputs[1])
                     out[0] = ref
                 else:
@@ -1154,23 +1225,14 @@ class FastEqSegmentedPolynomial(nn.Module):
                 print(f"input sort b_list:{ib_list}")
                 '''
 
-                fused_scatter = True
                 if len(output_indices) != 0:
                     b_list, _ = build_csr_buckets(output_indices[0], scatter_sum_dim)
-                    ref = fast_uniform1d_jit(w, x, y, input_indices[1], output_indices[0], b_list, self.u1d_meta, fused_scatter)
+                    ref = fast_uniform1d_jit(w, x, y, input_indices, output_indices, self.u1d_meta, b_list)
                 else:
-                    fused_scatter = False
-                    ref = fast_uniform1d_jit(w, x, y, input_indices[2], output_indices, input_indices[2], self.u1d_meta, fused_scatter)
+                    ref = fast_uniform1d_jit(w, x, y, input_indices, output_indices, self.u1d_meta, b_list=None)
 
                 
                 ref = ref.view(scatter_sum_dim, -1)
-
-                '''
-                x_src = x[input_indices[1]]
-                ref = fast_uniform1d(w, x_src, y, self.u1d_meta)
-                ref = ref.view(x_src.shape[0], -1)
-                ref = scatter_sum(ref, output_indices[0], dim=0, dim_size=scatter_sum_dim).view(scatter_sum_dim, -1)
-                '''
                 out[0] = ref
             elif self.op_name == "cwtp":
                 # mptp case use input and output indices
