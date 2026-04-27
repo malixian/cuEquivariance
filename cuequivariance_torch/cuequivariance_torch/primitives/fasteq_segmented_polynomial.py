@@ -750,6 +750,18 @@ def infer_fctp_meta(descriptor, math_dtype, device):
     i_for_k, val_for_k = make_cg_single_mapping(K_total, I_total, device, P, math_dtype)
     p_for_k = make_p_for_k(K_per_path, device)
 
+    nnz0 = int(nnz_per_path[0])
+
+    def can_use_empty_grad_x(i_for_k: torch.Tensor, I: int) -> bool:
+        i_cpu = i_for_k.detach().cpu()
+        valid = i_cpu[i_cpu >= 0]
+
+        if valid.numel() != I:
+            return False
+
+        sorted_i = torch.sort(valid).values
+        return torch.equal(sorted_i, torch.arange(I, dtype=sorted_i.dtype))
+
     return {
         "cg_indices": cg_indices,
         "cg_values": cg_values,
@@ -773,7 +785,12 @@ def infer_fctp_meta(descriptor, math_dtype, device):
         "cg_val_all": cg_val_all,
         "i_for_k": i_for_k,
         "val_for_k": val_for_k,
-        "p_for_k": p_for_k
+        "p_for_k": p_for_k,
+
+        "nnz0": nnz0,
+        "cg_val_0": cg_val_all[0],
+        "can_use_empty_grad_x": can_use_empty_grad_x(i_for_k, I_total)
+        
     }
 
 @torch._dynamo.disable
