@@ -761,6 +761,8 @@ def infer_fctp_meta(descriptor, math_dtype, device):
 
         sorted_i = torch.sort(valid).values
         return torch.equal(sorted_i, torch.arange(I, dtype=sorted_i.dtype))
+    
+    cg_val_0 = cg_val_all[0].item()
 
     return {
         "cg_indices": cg_indices,
@@ -788,7 +790,7 @@ def infer_fctp_meta(descriptor, math_dtype, device):
         "p_for_k": p_for_k,
 
         "nnz0": nnz0,
-        "cg_val_0": cg_val_all[0],
+        "cg_val_0": cg_val_0,
         "can_use_empty_grad_x": can_use_empty_grad_x(i_for_k, I_total)
         
     }
