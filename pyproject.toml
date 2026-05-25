@@ -22,7 +22,7 @@ name = "cuequivariance-torch"
 dynamic = ["version"]
 description = "CUDA accelerated equivariant operations"
 readme = "README.md"
-license = { file = "LICENSE" }
+#license = { file = "LICENSE" }
 authors = [{ name = "NVIDIA Corporation" }]
 requires-python = ">=3.10"
 dependencies = [
@@ -37,12 +37,12 @@ classifiers = [
 ]
 
 [tool.hatch.version]
-path = "cuequivariance_torch/VERSION"
+path = "VERSION"
 pattern = "(?P<version>\\d+\\.\\d+\\.\\d+(?:[a-z]+\\d+)?)"
 
 [tool.hatch.build.targets.wheel]
 packages = ["cuequivariance_torch"]
-force-include = { "Third_party_attr.txt" = "Third_party_attr.txt" }
+#force-include = { "Third_party_attr.txt" = "Third_party_attr.txt" }
 
 [tool.pytest.ini_options]
 markers = [

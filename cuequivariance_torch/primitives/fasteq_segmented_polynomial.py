@@ -762,7 +762,9 @@ def infer_fctp_meta(descriptor, math_dtype, device):
         sorted_i = torch.sort(valid).values
         return torch.equal(sorted_i, torch.arange(I, dtype=sorted_i.dtype))
     
-    cg_val_0 = cg_val_all[0].item()
+    print(f"cg_val_all:{cg_val_all}, shape:{cg_val_all.shape}", )
+
+    cg_val_0 = cg_val_all.reshape(-1)[0].item()
 
     return {
         "cg_indices": cg_indices,
@@ -933,12 +935,8 @@ class FastEqSegmentedPolynomial(nn.Module):
                 f"The polynomial is not a cue.SegmentedPolynomial, but a {type(polynomial)}",
                 "Did you forget to call `.polynomial` on the descriptor?",
             )
-
-        if method != "naive" and not HAS_CUE_OPS:
-            method = "naive"
-            warnings.warn(
-                "cuequivariance_ops_torch is not available. Falling back to naive implementation."
-            )
+        
+        print(f"==== fasteq method: {method}, op_name: {op_name}, u1d_compatible: {u1d_compatible} ====")
 
         if method == "uniform_1d":
             self.m = SegmentedPolynomialFromUniform1dJit(
@@ -964,8 +962,6 @@ class FastEqSegmentedPolynomial(nn.Module):
             self.fallback = self.m
         else:
             raise ValueError(f"Invalid method: {method}")
-
-        print(f"Init op:{op_name}, u1d_compatible:{u1d_compatible}, use_fasteq:{use_fasteq}, self.descriptor:{self.descriptor}")
 
         if use_fasteq and (op_name == "stc"):
             ds_ = [flatten_stp(d) for _, d in polynomial.operations]

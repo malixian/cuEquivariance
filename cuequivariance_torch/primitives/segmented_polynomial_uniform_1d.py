@@ -97,14 +97,6 @@ class SegmentedPolynomialFromUniform1dJit(nn.Module):
     ):
         super().__init__()
 
-        if tensor_product_uniform_1d_jit is None:
-            raise ImportError(
-                "Failed to construct SegmentedPolynomialFromUniform1dJit: "
-                "the 'cuequivariance_ops_torch.tensor_product_uniform_1d_jit' extension "
-                "is not available. Please install 'cuequivariance_ops_torch' "
-                "for method 'uniform_1d'."
-            )
-
         if not torch.jit.is_scripting():
             try:
                 polynomial = polynomial.flatten_coefficient_modes()
@@ -220,12 +212,13 @@ class SegmentedPolynomialFromUniform1dJit(nn.Module):
             float(p.coefficients) for o, stp in polynomial.operations for p in stp.paths
         ]
 
-        self.BATCH_DIM_AUTO = BATCH_DIM_AUTO
-        self.BATCH_DIM_SHARED = BATCH_DIM_SHARED
-        self.BATCH_DIM_BATCHED = BATCH_DIM_BATCHED
-        self.BATCH_DIM_INDEXED = BATCH_DIM_INDEXED
-
         self.polynomial = polynomial
+
+        if tensor_product_uniform_1d_jit is not None:
+            self.BATCH_DIM_AUTO = BATCH_DIM_AUTO
+            self.BATCH_DIM_SHARED = BATCH_DIM_SHARED
+            self.BATCH_DIM_BATCHED = BATCH_DIM_BATCHED
+            self.BATCH_DIM_INDEXED = BATCH_DIM_INDEXED
 
     def forward(
         self,
