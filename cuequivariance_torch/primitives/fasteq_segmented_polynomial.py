@@ -46,13 +46,17 @@ import time
 
 from fasteq.ops.equi_linear import fast_equi_linear
 from fasteq.ops.stc import fast_stc
-from fasteq.ops.cwtp import fast_cwtp
-from fasteq.ops.mptp import fast_mptp
 from fasteq.ops.fctp import fast_fctp
-from fasteq.ops.uniform1d_jit import fast_uniform1d_jit
+#from fasteq.ops.uniform1d_jit import fast_uniform1d_jit
+from fasteq.ops.uniform1d_jit_autotune import fast_uniform1d_jit
+from fasteq.ops.stc_uniform1d_jit import fast_stc_uniform1d_jit
+
 
 import math
 from torch.nn.utils.rnn import pad_sequence
+
+
+STC_PAD_VALUE = -1
 
 def flatten_stp(d: cue.SegmentedTensorProduct) -> cue.SegmentedTensorProduct:
     
@@ -88,264 +92,6 @@ def flatten_stp(d: cue.SegmentedTensorProduct) -> cue.SegmentedTensorProduct:
     d = d.split_mode(m, math.gcd(*d.get_dims(m)))
 
     return d
-
-@torch.no_grad()
-def infer_cwtp_meta(
-    descriptor,
-    math_dtype,
-    device,
-    max_k_dim_for_kernel: int = 8, # TODO: make it flexible
-) -> Dict[str, Any]:
-    """
-    生成 ChannelWise TP 的所有 meta 信息：
-      - 分段信息：uv / iu / jv / kv offsets + slices
-      - dense c_tensors + (i/j/k_dims, c_offsets, c_all)
-      - sparse CG 信息：
-        * cg_i_all, cg_j_all, cg_k_all, cg_val_all
-        * nnz_per_path, nnz_offsets
-      - 按 k 分组的 sparse meta：
-        * nnz_k_offsets: [P, MAX_K_DIM]
-        * nnz_k_counts:  [P, MAX_K_DIM]
-    """
-
-    # -------------------- 1) paths & dense c_tensors --------------------
-    path_indices: List[Tuple[int, int, int, int]] = []
-    c_tensors: List[torch.Tensor] = []
-
-    for path_idx, path in enumerate(descriptor.paths):
-        path_indices.append(tuple(path.indices))
-
-        c_tensor = torch.tensor(path.coefficients, dtype=math_dtype, device=device).contiguous()
-        c_tensors.append(c_tensor)
-
-    # U/V
-    u = list(descriptor.get_dims("u"))[0]
-    v = list(descriptor.get_dims("v"))[0]
-
-    UV_TOTAL = int(descriptor.operands[0].size)
-    IU_TOTAL = int(descriptor.operands[1].size)
-    JV_TOTAL = int(descriptor.operands[2].size)
-
-    '''
-    for ops in descriptor.operands:
-        print(f"==== ops: {ops} ====")
-        for seg in ops.segments:
-            print(f"seg: {seg}")
-    '''
-
-
-    # segment counts
-    uv_seg_count = max(p[0] for p in path_indices) + 1
-    iu_seg_count = max(p[1] for p in path_indices) + 1
-    jv_seg_count = max(p[2] for p in path_indices) + 1
-    kv_seg_count = max(p[3] for p in path_indices) + 1
-
-    # -------------------- 2) i/j/k dims + c_offsets + c_all --------------------
-    i_dims, j_dims, k_dims = [], [], []
-    c_offsets = [0]
-    c_flat_list = []
-    running = 0
-
-    for c in c_tensors:
-        i_dim, j_dim, k_dim = map(int, c.shape)
-        i_dims.append(i_dim)
-        j_dims.append(j_dim)
-        k_dims.append(k_dim)
-
-        c_flat = c.reshape(-1).contiguous()          # original layout (i,j,k) flatten => ((i*J + j)*K + k)
-        c_flat_list.append(c_flat)
-
-        running += i_dim * j_dim * k_dim
-        c_offsets.append(running)
-
-    c_all = (
-        torch.cat(c_flat_list, dim=0)
-        if len(c_flat_list) > 0
-        else torch.empty(0, dtype=math_dtype, device=device)
-    )
-
-    max_k_dim = max(k_dims) if len(k_dims) > 0 else 0
-    assert max_k_dim <= max_k_dim_for_kernel, \
-        f"max k_dim {max_k_dim} > kernel MAX_K_DIM {max_k_dim_for_kernel}"
-
-    # -------------------- 3) uv slices + uv_seg_offsets --------------------
-    uv_slices = []
-    uv_seg_offsets = []
-    start = 0
-    uv_stride = int(u * v)
-    for _ in range(uv_seg_count):
-        uv_seg_offsets.append(start)
-        end = start + uv_stride
-        uv_slices.append(slice(start, end))
-        start = end
-    assert start == UV_TOTAL, f"UV total {start} != {UV_TOTAL}"
-
-    # -------------------- 4) iu slices + iu_seg_offsets --------------------
-    iu_slices = []
-    iu_seg_offsets = []
-    start = 0
-    for s in range(iu_seg_count):
-        iu_seg_offsets.append(start)
-        idx = next(idx for idx, p in enumerate(path_indices) if p[1] == s)
-        i_dim = i_dims[idx]
-        length = int(i_dim * u)
-        end = start + length
-        iu_slices.append(slice(start, end))
-        start = end
-    assert start == IU_TOTAL, f"IU total {start} != {IU_TOTAL}"
-
-    # -------------------- 5) jv slices + jv_seg_offsets --------------------
-    jv_slices = []
-    jv_seg_offsets = []
-    start = 0
-    for s in range(jv_seg_count):
-        jv_seg_offsets.append(start)
-        idx = next(idx for idx, p in enumerate(path_indices) if p[2] == s)
-        j_dim = j_dims[idx]
-        length = int(j_dim * v)
-        end = start + length
-        jv_slices.append(slice(start, end))
-        start = end
-    assert start == JV_TOTAL, f"JV total {start} != {JV_TOTAL}"
-
-    # -------------------- 6) K offsets: kv_k_offsets --------------------
-    kv_k_offsets = []
-    start = 0
-    for s in range(kv_seg_count):
-        kv_k_offsets.append(start)
-        idx = next(idx for idx, p in enumerate(path_indices) if p[3] == s)
-        k_dim = k_dims[idx]
-        start += int(k_dim)
-    K_TOTAL = int(start)
-
-    # -------------------- 7) sparse CG meta + per-k grouping --------------------
-    cg_i_list, cg_j_list, cg_k_list, cg_val_list = [], [], [], []
-    nnz_per_path = []
-    nnz_offsets = [] 
-
-    nnz_k_offsets_list = []  # [P, MAX_K_DIM]
-    nnz_k_counts_list  = []  # [P, MAX_K_DIM]
-
-    nnz_running = 0
-    for path_id, c in enumerate(c_tensors):
-        i_dim, j_dim, k_dim = map(int, c.shape)
-
-        nz_idx = torch.nonzero(c != 0, as_tuple=False)  # [nnz,3] (i,j,k)
-        nnz = int(nz_idx.size(0))
-
-        #print(f"cwtp nnz path:{path_id}, nnz idx:{nz_idx}")
-
-        nnz_per_path.append(nnz)
-        nnz_offsets.append(nnz_running)
-        nnz_running += nnz
-
-        local_k_offsets = torch.zeros(max_k_dim_for_kernel, dtype=torch.int32, device=device)
-        local_k_counts  = torch.zeros(max_k_dim_for_kernel, dtype=torch.int32, device=device)
-
-        if nnz > 0:
-            sort_idx = torch.argsort(nz_idx[:, 2])  # sort by k
-            nz_sorted = nz_idx[sort_idx]
-            i_idx = nz_sorted[:, 0]
-            j_idx = nz_sorted[:, 1]
-            k_idx = nz_sorted[:, 2]
-
-
-            vals = c[i_idx, j_idx, k_idx]
-
-            cg_i_list.append(i_idx.to(torch.uint8))
-            cg_j_list.append(j_idx.to(torch.uint8))
-            cg_k_list.append(k_idx.to(torch.uint8))
-            cg_val_list.append(vals)
-
-            prev_k = int(k_idx[0].item())
-            local_k_offsets[prev_k] = 0
-
-            for t in range(1, nnz):
-                curr_k = int(k_idx[t].item())
-                if curr_k != prev_k:
-                    local_k_counts[prev_k] = t - int(local_k_offsets[prev_k].item())
-                    local_k_offsets[curr_k] = t
-                    prev_k = curr_k
-
-            local_k_counts[prev_k] = nnz - int(local_k_offsets[prev_k].item())
-
-        nnz_k_offsets_list.append(local_k_offsets)
-        nnz_k_counts_list.append(local_k_counts)
-
-    if len(cg_i_list) > 0:
-        cg_i_all = torch.cat(cg_i_list, dim=0).contiguous()
-        cg_j_all = torch.cat(cg_j_list, dim=0).contiguous()
-        cg_k_all = torch.cat(cg_k_list, dim=0).contiguous()
-        cg_val_all = torch.cat(cg_val_list, dim=0).contiguous()
-    else:
-        cg_i_all = torch.empty(0, dtype=torch.uint8, device=device)
-        cg_j_all = torch.empty(0, dtype=torch.uint8, device=device)
-        cg_k_all = torch.empty(0, dtype=torch.uint8, device=device)
-        cg_val_all = torch.empty(0, dtype=math_dtype, device=device)
-
-    nnz_per_path_t = torch.tensor(nnz_per_path, dtype=torch.int32, device=device)
-    nnz_offsets_t  = torch.tensor(nnz_offsets,  dtype=torch.int32, device=device)
-
-    nnz_k_offsets = torch.stack(nnz_k_offsets_list, dim=0).contiguous()  # [P, MAX_K_DIM]
-    nnz_k_counts  = torch.stack(nnz_k_counts_list,  dim=0).contiguous()  # [P, MAX_K_DIM]
-    nnz_k_offsets_flat = nnz_k_offsets.reshape(-1).contiguous()
-    nnz_k_counts_flat  = nnz_k_counts.reshape(-1).contiguous()
-
-    # -------------------- 8) pack tensors for kernels --------------------
-    path_indices_tensor = torch.tensor(path_indices, dtype=torch.int32, device=device).contiguous()
-    i_dims_t = torch.tensor(i_dims, dtype=torch.int32, device=device).contiguous()
-    j_dims_t = torch.tensor(j_dims, dtype=torch.int32, device=device).contiguous()
-    k_dims_t = torch.tensor(k_dims, dtype=torch.int32, device=device).contiguous()
-    c_offsets_t = torch.tensor(c_offsets, dtype=torch.int32, device=device).contiguous()  # [P+1]
-
-    meta = {
-        # dense
-        "c_tensors": c_tensors,
-        "path_indices": path_indices,
-
-        # dense packed (original i-j-k flatten)
-        "path_indices_tensor": path_indices_tensor,  # [P,4] int32
-        "c_all": c_all,                              # [sum(i*j*k)] layout ((i*J+j)*K+k)
-        "c_offsets": c_offsets_t,                    # [P+1]
-
-        # slices (reference)
-        "uv_slices": uv_slices,
-        "iu_slices": iu_slices,
-        "jv_slices": jv_slices,
-
-        # offsets
-        "uv_seg_offsets": torch.tensor(uv_seg_offsets, dtype=torch.int32, device=device).contiguous(),
-        "iu_seg_offsets": torch.tensor(iu_seg_offsets, dtype=torch.int32, device=device).contiguous(),
-        "jv_seg_offsets": torch.tensor(jv_seg_offsets, dtype=torch.int32, device=device).contiguous(),
-        "kv_k_offsets": torch.tensor(kv_k_offsets, dtype=torch.int32, device=device).contiguous(),
-
-        # dims
-        "i_dims": i_dims_t,
-        "j_dims": j_dims_t,
-        "k_dims": k_dims_t,
-
-        # sizes
-        "U": int(u),
-        "V": int(v),
-        "UV_TOTAL": UV_TOTAL,
-        "IU_TOTAL": IU_TOTAL,
-        "JV_TOTAL": JV_TOTAL,
-        "K_TOTAL": K_TOTAL,
-
-        # sparse CG info
-        "cg_i_all": cg_i_all,
-        "cg_j_all": cg_j_all,
-        "cg_k_all": cg_k_all,
-        "cg_val_all": cg_val_all,
-        "nnz_per_path": nnz_per_path_t,
-        "nnz_offsets": nnz_offsets_t,  # length P (start offset per path)
-
-        # sparse per-k grouping
-        "nnz_k_offsets": nnz_k_offsets_flat,  # [P*MAX_K_DIM]
-        "nnz_k_counts": nnz_k_counts_flat,    # [P*MAX_K_DIM]
-        "MAX_K_DIM": int(max_k_dim_for_kernel),
-    }
-    return meta
 
 @torch.no_grad()
 def build_grouped_paths(path_segment_indices: torch.Tensor,
@@ -456,179 +202,132 @@ def build_grouped_paths_as_buffers(
     module.register_buffer(f"{prefix}v_offsets", v_offsets, persistent=persistent)
 
 @torch.no_grad()
-def build_csr_buckets(cls_idx: torch.Tensor, S: int):
-    """
-    cls_idx: [B] int32/int64, on CUDA, values in [0..S-1]
-    returns:
-      b_list: [B] int32 CUDA
-      cls_offsets: [S+1] int32 CUDA
-    """
-    assert cls_idx.is_cuda
-    order = torch.argsort(cls_idx.to(torch.int64), stable=True)   # [B]
-    b_list = order.to(torch.int32)
-
-    counts = torch.bincount(cls_idx.to(torch.int64), minlength=S) # [S] on CUDA
-    cls_offsets = torch.empty(S + 1, device=cls_idx.device, dtype=torch.int32)
-    cls_offsets[0] = 0
-    cls_offsets[1:] = torch.cumsum(counts, dim=0).to(torch.int32)
-    return b_list, cls_offsets
-
-@torch.no_grad()
-def build_k_sliced_ell_packed(
-    num_paths: int,
-    MAX_K_DIM: int,
-    k_dims: torch.Tensor,          # [num_paths] int32
-    nnz_offsets: torch.Tensor,     # [num_paths] int32
-    nnz_k_offsets: torch.Tensor,   # [num_paths * MAX_K_DIM] int32
-    nnz_k_counts: torch.Tensor,    # [num_paths * MAX_K_DIM] int32
-    cg_i_all: torch.Tensor,        # [nnz_total] uint8
-    cg_j_all: torch.Tensor,        # [nnz_total] uint8
-    cg_val_all: torch.Tensor,      # [nnz_total] float/double
-    sort_within_k: bool = True,    # 可选：每个k内按(i,j)排序
+def build_padded_stc_paths_as_buffers(
+    module: nn.Module,
+    path_segment_indices,
+    path_coefficients,
+    *,
+    prefix: str = "stc_",
+    device=None,
+    persistent: bool = False,
+    pad_value: int = STC_PAD_VALUE,
 ):
     """
-    输出：
-      ell_E    : [num_paths] int32，E[p]=max nnz per k
-      ell_base : [num_paths] int32，ell_ij/ell_val 的起点（以 element 为单位）
-      ell_ij   : [ell_total] uint16，按 (k_local * E + e) 排布
-      ell_val  : [ell_total] scalar，同上
+    Build STC path metadata once and register it as module buffers.
+
+    The generated STC-uniform1d kernel uses baseline-compatible padded path
+    semantics:
+
+        len == 3: [x1_a,                 x0_d, out_v, pad, ...]
+        len == 4: [x1_a, x1_b,          x0_d, out_v, pad, ...]
+        len == 5: [x1_a, x1_b, x1_c,   x0_d, out_v, pad, ...]
+
+    We use ``pad_value=-1`` instead of 0 so that the valid prefix can be
+    inferred from ``paths`` itself.  ``path_lens`` is still materialized once
+    during preprocessing because the existing baseline/backward kernels use it,
+    but forward does not need to recompute or parse it.
+
+    Registered buffers:
+        {prefix}coeffs      : [P], math dtype
+        {prefix}paths       : [P, max_path_len], int32, padded with -1
+        {prefix}path_lens   : [P], int32, inferred before padding
+        {prefix}idx_lists   : [max_path_len, P], int32, padded with -1
+
+    Returned metadata additionally contains:
+        baseline_args       : args for fast_stc fallback
+        uniform1d_jit_args  : args for fast_stc_uniform1d_jit, already parsed
     """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    if len(path_segment_indices) == 0:
+        raise ValueError("STC preprocessing got empty path_segment_indices")
 
-    assert k_dims.dtype == torch.int32
-    assert nnz_offsets.dtype == torch.int32
-    assert nnz_k_offsets.dtype == torch.int32
-    assert nnz_k_counts.dtype == torch.int32
-    assert cg_i_all.dtype == torch.uint8 and cg_j_all.dtype == torch.uint8
-    assert cg_val_all.dtype in (torch.float16, torch.float32, torch.float64)
+    path_tensors = [
+        torch.as_tensor(p, dtype=torch.int32).reshape(-1)
+        for p in path_segment_indices
+    ]
+    path_lens = torch.tensor(
+        [int(p.numel()) for p in path_tensors],
+        dtype=torch.int32,
+    )
+    max_path_len = int(path_lens.max().item())
+    if max_path_len < 3:
+        raise ValueError(f"Bad STC max_path_len={max_path_len}; expected >= 3")
 
-    device = cg_val_all.device
-    k_dims_cpu        = k_dims.cpu()
-    nnz_offsets_cpu   = nnz_offsets.cpu()
-    nnz_k_offsets_cpu = nnz_k_offsets.cpu()
-    nnz_k_counts_cpu  = nnz_k_counts.cpu()
-    cg_i_cpu          = cg_i_all.cpu()
-    cg_j_cpu          = cg_j_all.cpu()
-    cg_val_cpu        = cg_val_all.cpu()
+    # Pad variable-length paths to [P, max_path_len].  -1 is a true sentinel:
+    # valid x1/x0/out segment indices are non-negative, so path_lens can be
+    # recovered as (paths != -1).sum(dim=1) if needed.
+    paths = pad_sequence(
+        path_tensors,
+        batch_first=True,
+        padding_value=int(pad_value),
+    ).contiguous()
 
-    # 1) 计算 E[p]
-    ell_E_cpu = torch.empty((num_paths,), dtype=torch.int32)
-    for p in range(num_paths):
-        k_dim = int(k_dims_cpu[p].item())
-        if k_dim <= 0:
-            ell_E_cpu[p] = 0
-            continue
-        counts = nnz_k_counts_cpu[p * MAX_K_DIM : p * MAX_K_DIM + k_dim]
-        ell_E_cpu[p] = int(counts.max().item()) if counts.numel() > 0 else 0
+    inferred_lens = (paths != int(pad_value)).sum(dim=1).to(torch.int32)
+    if not torch.equal(inferred_lens.cpu(), path_lens.cpu()):
+        raise RuntimeError("Internal STC padding error: inferred path_lens mismatch")
 
-    # 2) 计算 base 偏移（prefix sum）
-    ell_base_cpu = torch.empty((num_paths,), dtype=torch.int32)
-    total = 0
-    for p in range(num_paths):
-        ell_base_cpu[p] = total
-        k_dim = int(k_dims_cpu[p].item())
-        E = int(ell_E_cpu[p].item())
-        total += k_dim * E
+    # Ensure padding only appears on the right.  This prevents a malformed path
+    # such as [x1, -1, x0, out, -1] from silently producing the wrong len.
+    for pidx, L in enumerate(path_lens.tolist()):
+        row = paths[pidx]
+        if L > 0 and bool((row[:L] == int(pad_value)).any().item()):
+            raise ValueError(f"STC path {pidx} contains pad_value inside valid prefix")
+        if L < max_path_len and bool((row[L:] != int(pad_value)).any().item()):
+            raise ValueError(f"STC path {pidx} has non-padding values after valid prefix")
 
-    # 3) 分配 ELL 数组（pad: val=0，ij=0）
-    ell_ij_cpu  = torch.zeros((total,), dtype=torch.uint16)
-    ell_val_cpu = torch.zeros((total,), dtype=cg_val_cpu.dtype)
+    coeffs = torch.as_tensor(path_coefficients).contiguous()
+    if coeffs.reshape(-1).numel() != len(path_tensors):
+        raise ValueError(
+            f"STC coeff count {coeffs.reshape(-1).numel()} does not match "
+            f"num_paths={len(path_tensors)}"
+        )
 
-    # 4) 填充
-    for p in range(num_paths):
-        k_dim = int(k_dims_cpu[p].item())
-        if k_dim <= 0:
-            continue
-        E = int(ell_E_cpu[p].item())
-        if E <= 0:
-            continue
+    coeffs_buf = coeffs.to(device=device)
+    paths_buf = paths.to(device=device)
+    path_lens_buf = path_lens.to(device=device)
 
-        base = int(ell_base_cpu[p].item())
-        nnz_off = int(nnz_offsets_cpu[p].item())
+    module.register_buffer(f"{prefix}coeffs", coeffs_buf, persistent=persistent)
+    module.register_buffer(f"{prefix}paths", paths_buf, persistent=persistent)
+    module.register_buffer(f"{prefix}path_lens", path_lens_buf, persistent=persistent)
 
-        for k_local in range(k_dim):
-            meta_idx = p * MAX_K_DIM + k_local
-            local_off = int(nnz_k_offsets_cpu[meta_idx].item())
-            local_cnt = int(nnz_k_counts_cpu[meta_idx].item())
-            # 该k的输出行起点
-            row = base + k_local * E
+    # List-based layout for STC-uniform1d adapter.  Shape is [max_path_len, P],
+    # so idx_lists[t] is the t-th operand-index list across all paths.
+    idx_lists_tensor = paths.t().contiguous()
+    idx_lists_buf = idx_lists_tensor.to(device=device)
+    module.register_buffer(f"{prefix}idx_lists", idx_lists_buf, persistent=persistent)
 
-            if local_cnt <= 0:
-                continue
+    paths_buffer = getattr(module, f"{prefix}paths")
+    path_lens_buffer = getattr(module, f"{prefix}path_lens")
+    coeffs_buffer = getattr(module, f"{prefix}coeffs")
+    idx_lists_buffer = getattr(module, f"{prefix}idx_lists")
 
-            # 拿到该k的 nnz 索引范围：idx = nnz_off + (local_off + tt)
-            idxs = torch.arange(local_off, local_off + local_cnt, dtype=torch.int32)
-            gidx = (nnz_off + idxs).to(torch.int64)  # 作为索引用 int64
-
-            ii = cg_i_cpu[gidx].to(torch.int32)
-            jj = cg_j_cpu[gidx].to(torch.int32)
-            vv = cg_val_cpu[gidx]
-
-            if sort_within_k:
-                # sort key: i major then j
-                key = ii * 256 + jj
-                order = torch.argsort(key)
-                ii = ii[order]; jj = jj[order]; vv = vv[order]
-
-            # 写入前 local_cnt 个，其余 pad=0
-            w = min(local_cnt, E)
-            # pack: ij = i | (j<<8)
-            ij = (ii[:w] & 0xFF) | ((jj[:w] & 0xFF) << 8)
-            ell_ij_cpu[row : row + w]  = ij.to(torch.uint16)
-            ell_val_cpu[row : row + w] = vv[:w]
-
-            # pad 部分已是0：val=0 => acc +=0，可无分支
-
-    # 5) 搬回 device（通常是 GPU）
-    ell_E    = ell_E_cpu.to(device=device)
-    ell_base = ell_base_cpu.to(device=device)
-    ell_ij   = ell_ij_cpu.to(device=device)
-    ell_val  = ell_val_cpu.to(device=device)
-    ell_meta = {
-        "ell_E": ell_E,
-        "ell_base": ell_base,
-        "ell_ij": ell_ij,
-        "ell_val": ell_val,
+    meta = {
+        "coeffs": coeffs_buffer,
+        "paths": paths_buffer,
+        "path_lens": path_lens_buffer,
+        "idx_lists_tensor": idx_lists_buffer,
+        "idx_lists": [idx_lists_buffer[t] for t in range(max_path_len)],
+        "num_paths": int(len(path_segment_indices)),
+        "max_path_len": max_path_len,
+        "pad_value": int(pad_value),
     }
-    return ell_meta
 
-@torch.no_grad()
-def build_packed_meta(path_indices: torch.Tensor,
-                      k_dims: torch.Tensor,
-                      ell_E: torch.Tensor,
-                      ell_base: torch.Tensor,
-                      iu_seg_offsets: torch.Tensor,
-                      jv_seg_offsets: torch.Tensor,
-                      kv_k_offsets: torch.Tensor,
-                      U: int):
-    """
-    path_indices: [P,4] int32 (uv_idx, iu_idx, jv_idx, kv_idx)
-    k_dims:      [P]   int32
-    ell_E:       [P]   int32
-    ell_base:    [P]   int32
-    offsets: small fixed int32 tensors on GPU
-    returns:
-      meta1: [P,4] int32  (uv_base, iu_base, jv_base, k_base)
-      meta2: [P,4] int32  (k_dim, E, ell_base, pad)
-    """
-    assert path_indices.dtype == torch.int32 and path_indices.is_cuda
-    P = path_indices.shape[0]
+    # Pre-parse argument packs once.  Forward should only unpack these tuples;
+    # it should not rebuild padding or call a flexible _parse_fast_stc_args path.
+    meta["baseline_args"] = (
+        coeffs_buffer,
+        paths_buffer,
+        path_lens_buffer,
+    )
+    meta["uniform1d_jit_args"] = (
+        coeffs_buffer,
+        paths_buffer,
+        idx_lists_buffer,
+    )
 
-    uv_idx = path_indices[:, 0]
-    iu_idx = path_indices[:, 1]
-    jv_idx = path_indices[:, 2]
-    kv_idx = path_indices[:, 3]
-
-    uv_base = uv_idx * U                         # V==1, x_uv is [K][U]
-    iu_base = iu_seg_offsets[iu_idx]             # gather from tiny fixed offsets
-    jv_base = jv_seg_offsets[jv_idx]
-    k_base  = kv_k_offsets[kv_idx]
-
-    meta1 = torch.stack([uv_base, iu_base, jv_base, k_base], dim=1).contiguous()  # [P,4] int32
-    pad   = torch.zeros((P,), device=meta1.device, dtype=torch.int32)
-    meta2 = torch.stack([k_dims, ell_E, ell_base, pad], dim=1).contiguous()       # [P,4] int32
-
-    return meta1, meta2
+    return meta
 
 @torch.no_grad()
 def make_p_for_k(K_per_path, device):
@@ -969,60 +668,49 @@ class FastEqSegmentedPolynomial(nn.Module):
             self.num_out_segments = d_max.operands[-1].num_segments
             self.u = d_max.operands[0].size // d_max.operands[0].num_segments
 
-            path_segment_indices = sum((d.indices.tolist() for  d in ds_), [])
+            path_segment_indices = sum((d.indices.tolist() for d in ds_), [])
             path_coefficients = sum((d.stacked_coefficients.tolist() for d in ds_), [])
 
-            print(f"op_name:{op_name}, desc:{self.descriptor}")
+            print(f"op_name:{op_name}, desc:{self.descriptor}") 
 
-            device = "cuda" # TODO: make it general
-            self.coeffs_tensor = torch.as_tensor(path_coefficients, dtype=math_dtype).to(device)
-            self.path_lens_tensor = torch.as_tensor([len(p) for p in path_segment_indices], dtype=torch.int32).to(device)
-            self.paths_tensor = pad_sequence(
-                [torch.as_tensor(p, dtype=torch.int32) for p in path_segment_indices],
-                batch_first=True, padding_value=0
-            ).to(device)
-        
-        elif use_fasteq and op_name == "cwtp" and not u1d_compatible:
-            self.meta = infer_cwtp_meta(self.descriptor, math_dtype=math_dtype, device="cuda") # device hardcoded for now
-            cg_i_groupk = self.meta["cg_i_all"]
-            cg_j_groupk  = self.meta["cg_j_all"]
-            cg_val_groupk  = self.meta["cg_val_all"]
-            nnz_per_path = self.meta["nnz_per_path"]
-            nnz_offsets_groupk = self.meta["nnz_offsets"]
-            nnz_k_offsets_groupk = self.meta["nnz_k_offsets"]
-            nnz_k_counts_groupk = self.meta["nnz_k_counts"]
-            k_dims = self.meta["k_dims"]
 
-            num_paths = nnz_per_path.shape[0]
-            self.ell_meta = build_k_sliced_ell_packed(
-                num_paths=num_paths,
-                MAX_K_DIM=8,
-                k_dims=k_dims,                  # int32
-                nnz_offsets=nnz_offsets_groupk,         # int32
-                nnz_k_offsets=nnz_k_offsets_groupk,     # int32
-                nnz_k_counts=nnz_k_counts_groupk,       # int32
-                cg_i_all=cg_i_groupk,               # uint8
-                cg_j_all=cg_j_groupk,               # uint8
-                cg_val_all=cg_val_groupk,           # float/double
-                sort_within_k=True,
+            self.stc_meta = build_padded_stc_paths_as_buffers(
+                self,
+                path_segment_indices,
+                torch.as_tensor(path_coefficients, dtype=math_dtype),
+                prefix="stc_",
+                device="cuda",
+                persistent=False,
+                pad_value=STC_PAD_VALUE,
             )
+            self.stc_meta["num_out_segments"] = int(self.num_out_segments)
+            self.stc_meta["u"] = int(self.u)
 
-            uv_seg_offsets = self.meta["uv_seg_offsets"]
-            iu_seg_offsets = self.meta["iu_seg_offsets"]
-            jv_seg_offsets = self.meta["jv_seg_offsets"]
-            kv_k_offsets = self.meta["kv_k_offsets"]
-            path_indices = self.meta["path_indices_tensor"]
-            U = self.meta["U"]
+            # Keep the old attribute names for fallback/debug code, but make
+            # them aliases of the one canonical preprocessed metadata.
+            self.coeffs_tensor = self.stc_meta["coeffs"]
+            self.paths_tensor = self.stc_meta["paths"]
+            self.path_lens_tensor = self.stc_meta["path_lens"]
 
-            meta1, meta2 = build_packed_meta(path_indices, k_dims, self.ell_meta["ell_E"], self.ell_meta["ell_base"], iu_seg_offsets, jv_seg_offsets, kv_k_offsets, U)
-
-            self.ell_meta["meta1"] = meta1
-            self.ell_meta["meta2"] = meta2
-
-        elif use_fasteq and ((op_name == "cwtp" and u1d_compatible) or (op_name == "uniform1d")):
+            # Complete pre-parsed argument packs, including num_out_segments.
+            self.stc_meta["baseline_args"] = (
+                self.stc_meta["coeffs"],
+                self.stc_meta["paths"],
+                self.stc_meta["path_lens"],
+                self.stc_meta["num_out_segments"],
+            )
+            self.stc_meta["uniform1d_jit_args"] = (
+                self.stc_meta["coeffs"],
+                self.stc_meta["paths"],
+                self.stc_meta["idx_lists_tensor"],
+                self.stc_meta["num_out_segments"],
+            )
+            #print(f"stc meta:{self.stc_meta}")
+        
+        elif use_fasteq and self.op_name == "cwtp" and self.method == "uniform_1d":
 
             self.descriptor = self.m.polynomial.operations[0][1]
-            print(f"cwtp u1d compatible path, descriptor:{self.descriptor}")
+            print(f"uniform1d path, descriptor:{self.descriptor}")
             print(f"polynomial.operations:{self.m.polynomial.operations}")
 
             ds_ = [d for _, d in self.m.polynomial.operations]
@@ -1211,72 +899,25 @@ class FastEqSegmentedPolynomial(nn.Module):
 
                 #print(f"x1 shape:{x1.shape}, x0 shape:{x0.shape}, i0 shape:{i0.shape}")
 
-                ref = fast_stc(
-                    x1, x0, i0, 
-                    self.coeffs_tensor, 
-                    self.paths_tensor, 
-                    self.path_lens_tensor, 
-                    self.num_out_segments,
-                )
+                if fast_stc_uniform1d_jit is not None:
+                    ref = fast_stc_uniform1d_jit(
+                        x1, x0, i0,
+                        *self.stc_meta["uniform1d_jit_args"],
+                    )
+                else:
+                    ref = fast_stc(
+                        x1, x0, i0,
+                        *self.stc_meta["baseline_args"],
+                    )
                 out[0] = ref
-            elif self.op_name == "uniform1d" or (self.op_name == "cwtp" and self.u1d_compatible):
+            elif self.op_name == "cwtp" and self.method == "uniform_1d":
                 
                 w = inputs[0]
                 x = inputs[1]
                 y = inputs[2]
-                scatter_sum_dim = x.shape[0]
-
-                '''
-                print(f"input:{input_indices[1]}")
-                print(f"output:{output_indices[0]}")
-
-                perm = torch.argsort(input_indices[1])
-                input_sorted = input_indices[1][perm]
-                out_sorted   = output_indices[0][perm]
-                print(f"input sorted:{input_sorted}")
-                print(f"output sorted:{out_sorted}")
-
-                ib_list, icls_offsets = build_csr_buckets(input_indices[1], scatter_sum_dim)
-                print(f"input sort b_list:{ib_list}")
-                '''
-
-                if len(output_indices) != 0:
-                    b_list, _ = build_csr_buckets(output_indices[0], scatter_sum_dim)
-                    ref = fast_uniform1d_jit(w, x, y, input_indices, output_indices, self.u1d_meta, b_list)
-                else:
-                    ref = fast_uniform1d_jit(w, x, y, input_indices, output_indices, self.u1d_meta, b_list=None)
-
                 
-                ref = ref.view(scatter_sum_dim, -1)
+                ref = fast_uniform1d_jit(w, x, y, input_indices, output_indices, self.u1d_meta)
                 out[0] = ref
-            elif self.op_name == "cwtp":
-                # mptp case use input and output indices
-                if input_indices.get(1) is not None and output_indices.get(0) is not None:
-                    '''
-                    for k, v in input_indices.items():
-                        print(f"input_indices key:{k}, value:{v}")
-                    for k, v in output_indices.items():
-                        print(f"output_indices key:{k}, value:{v}")
-                    for inp in inputs:
-                        print(f"input shape:{inp.shape}")
-                    '''
-                    w, x, y = inputs[0], inputs[1], inputs[2]
-                    sender = input_indices[1].to(torch.int32)
-                    receiver= output_indices[0].to(torch.int32)
-                    ref = fast_mptp(
-                        w, x, y,sender, receiver,
-                        self.meta,
-                    )
-                    out[0] = ref
-                # cwtp case use only inputs
-                else:
-                    w, x, y = inputs[0], inputs[1], inputs[2]
-                    ref = fast_cwtp(
-                        w, x, y,
-                        self.meta,
-                        self.ell_meta,
-                    )
-                    out[0] = ref
             elif self.op_name == "fctp":
                 w, x, y = inputs[0], inputs[1], inputs[2]
                 ref = fast_fctp(
