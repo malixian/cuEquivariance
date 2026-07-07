@@ -45,11 +45,9 @@ import time
 #from mace.tools.scatter import scatter_sum
 
 from fasteq.ops.equi_linear import fast_equi_linear
-from fasteq.ops.stc import fast_stc
 from fasteq.ops.fctp import fast_fctp
-#from fasteq.ops.uniform1d_jit import fast_uniform1d_jit
-from fasteq.ops.uniform1d_jit_autotune import fast_uniform1d_jit
-from fasteq.ops.stc_uniform1d_jit import fast_stc_uniform1d_jit
+from fasteq.ops.uniform1d_jit import fast_uniform1d_jit
+from fasteq.ops.stc import fast_stc_uniform1d_jit
 
 
 import math
@@ -685,20 +683,6 @@ class FastEqSegmentedPolynomial(nn.Module):
             )
             self.stc_meta["num_out_segments"] = int(self.num_out_segments)
             self.stc_meta["u"] = int(self.u)
-
-            # Keep the old attribute names for fallback/debug code, but make
-            # them aliases of the one canonical preprocessed metadata.
-            self.coeffs_tensor = self.stc_meta["coeffs"]
-            self.paths_tensor = self.stc_meta["paths"]
-            self.path_lens_tensor = self.stc_meta["path_lens"]
-
-            # Complete pre-parsed argument packs, including num_out_segments.
-            self.stc_meta["baseline_args"] = (
-                self.stc_meta["coeffs"],
-                self.stc_meta["paths"],
-                self.stc_meta["path_lens"],
-                self.stc_meta["num_out_segments"],
-            )
             self.stc_meta["uniform1d_jit_args"] = (
                 self.stc_meta["coeffs"],
                 self.stc_meta["paths"],
@@ -899,16 +883,11 @@ class FastEqSegmentedPolynomial(nn.Module):
 
                 #print(f"x1 shape:{x1.shape}, x0 shape:{x0.shape}, i0 shape:{i0.shape}")
 
-                if fast_stc_uniform1d_jit is not None:
-                    ref = fast_stc_uniform1d_jit(
-                        x1, x0, i0,
-                        *self.stc_meta["uniform1d_jit_args"],
-                    )
-                else:
-                    ref = fast_stc(
-                        x1, x0, i0,
-                        *self.stc_meta["baseline_args"],
-                    )
+                ref = fast_stc_uniform1d_jit(
+                    x1, x0, i0,
+                    *self.stc_meta["uniform1d_jit_args"],
+                )
+                
                 out[0] = ref
             elif self.op_name == "cwtp" and self.method == "uniform_1d":
                 
