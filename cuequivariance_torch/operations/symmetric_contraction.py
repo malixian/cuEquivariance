@@ -267,21 +267,21 @@ class SymmetricContraction(torch.nn.Module):
 
         if self.use_fasteq:
 
-            #torch.cuda.synchronize()
-            #start_time = time.perf_counter() * 1000
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
 
             weight = self.project_weight
             output = self.ff([weight, self.transpose_in(x)], input_indices={0: indices})
 
-            #torch.cuda.synchronize()
-            #end_time = time.perf_counter() * 1000
-            #execution_time_ms = end_time - start_time
-            #print(f"<< fasteq stc forward cost: {execution_time_ms:.3f} ms >>")
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"<< fasteq stc forward cost: {execution_time_ms:.3f} ms >>")
 
         else:
 
-            #torch.cuda.synchronize()
-            #start_time = time.perf_counter() * 1000
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
 
             if self.projection is not None:
                 weight = torch.einsum("zau,ab->zbu", self.weight, self.projection)
@@ -290,9 +290,9 @@ class SymmetricContraction(torch.nn.Module):
             weight = weight.flatten(1)
             output = self.f([weight, self.transpose_in(x)], input_indices={0: indices})
 
-            #torch.cuda.synchronize()
-            #end_time = time.perf_counter() * 1000
-            #execution_time_ms = end_time - start_time
-            #print(f"<< cueq stc forward cost: {execution_time_ms:.3f} ms >>")
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"<< cueq stc forward cost: {execution_time_ms:.3f} ms >>")
             
         return self.transpose_out(output[0])

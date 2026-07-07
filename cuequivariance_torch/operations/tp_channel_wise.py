@@ -265,8 +265,8 @@ class ChannelWiseTensorProduct(torch.nn.Module):
                     "Internal weights are not used, weight should not be None"
                 )
         if self.use_fasteq:
-            #torch.cuda.synchronize()
-            #start_time = time.perf_counter() * 1000
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
 
             output = self.ff(
                 [weight, x1, x2],
@@ -275,17 +275,14 @@ class ChannelWiseTensorProduct(torch.nn.Module):
                 output_indices=indices_out,
             )
 
-            #torch.cuda.synchronize()
-            #end_time = time.perf_counter() * 1000
-            #execution_time_ms = end_time - start_time
-            #print(f"<< fasteq cwtp forward cost: {execution_time_ms:.3f} ms >>")
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"<< fasteq cwtp forward cost: {execution_time_ms:.3f} ms >>")
         else:
             
-            #print(f"cueq cwtp descriptor:{self}")
-            #print(f"weight shape:{weight.shape}, x1 shape:{x1.shape}, x2 shape:{x2.shape}")
-            
-            #torch.cuda.synchronize()
-            #start_time = time.perf_counter() * 1000
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
 
             output = self.f(
                 [weight, x1, x2],
@@ -294,8 +291,8 @@ class ChannelWiseTensorProduct(torch.nn.Module):
                 output_indices=indices_out,
             )
 
-            #torch.cuda.synchronize()
-            #end_time = time.perf_counter() * 1000
-            #execution_time_ms = end_time - start_time
-            #print(f"<< cueq cwtp forward cost: {execution_time_ms:.3f} ms >>")
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"<< cueq cwtp forward cost: {execution_time_ms:.3f} ms >>")
         return self.transpose_out(output[0])
