@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 import warnings
 from typing import Optional
 import time
@@ -55,6 +56,11 @@ class SymmetricContraction(torch.nn.Module):
         use_fallback (bool, optional, deprecated): Whether to use a "fallback" implementation, now maps to method:
             If `True` the "naive" method is used.
             If `False` the "uniform_1d" method is used (make sure all segments have the same shape).
+        use_fasteq (bool, optional): Enables support for the FastEq inference path. The
+            FastEq path is actually selected only when ``original_mace=True`` and
+            the environment variable ``FASTEQ_INFERENCE`` is set to ``1``,
+            ``true``, ``yes``, or ``on``. This keeps the original differentiable
+            MACE path active during training.
 
     Examples:
         >>> device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
@@ -207,8 +213,14 @@ class SymmetricContraction(torch.nn.Module):
             self.method = method
         
         self.use_fasteq = use_fasteq
-        
-        if use_fasteq and original_mace:
+        self.fast_inference = (
+            use_fasteq
+            and original_mace
+            and os.environ.get("FASTEQ_INFERENCE", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+
+        if self.fast_inference:
             self.register_buffer("project_weight",
                                 torch.empty(0, device=device, dtype=dtype),
                                 persistent=False)
@@ -221,7 +233,7 @@ class SymmetricContraction(torch.nn.Module):
                 self.etp.polynomial,
                 method=self.method,
                 math_dtype=math_dtype,
-                use_fasteq=use_fasteq,
+                use_fasteq=True,
                 op_name="stc", # symmetric contraction
             ).to(device)
 
@@ -265,23 +277,23 @@ class SymmetricContraction(torch.nn.Module):
         """
         #print(f"STC weight shape: {self.weight.shape}, x shape: {x.shape}, indices shape: {indices.shape}")
 
-        if self.use_fasteq:
+        if self.fast_inference:
 
-            torch.cuda.synchronize()
-            start_time = time.perf_counter() * 1000
+            #torch.cuda.synchronize()
+            #start_time = time.perf_counter() * 1000
 
             weight = self.project_weight
             output = self.ff([weight, self.transpose_in(x)], input_indices={0: indices})
-
-            torch.cuda.synchronize()
-            end_time = time.perf_counter() * 1000
-            execution_time_ms = end_time - start_time
-            print(f"<< fasteq stc forward cost: {execution_time_ms:.3f} ms >>")
+            
+            #torch.cuda.synchronize()
+            #end_time = time.perf_counter() * 1000
+            #execution_time_ms = end_time - start_time
+            #print(f"<< fasteq stc forward cost: {execution_time_ms:.3f} ms >>")
 
         else:
 
-            torch.cuda.synchronize()
-            start_time = time.perf_counter() * 1000
+            """ torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000 """
 
             if self.projection is not None:
                 weight = torch.einsum("zau,ab->zbu", self.weight, self.projection)
@@ -290,9 +302,9 @@ class SymmetricContraction(torch.nn.Module):
             weight = weight.flatten(1)
             output = self.f([weight, self.transpose_in(x)], input_indices={0: indices})
 
-            torch.cuda.synchronize()
+            """ torch.cuda.synchronize()
             end_time = time.perf_counter() * 1000
             execution_time_ms = end_time - start_time
-            print(f"<< cueq stc forward cost: {execution_time_ms:.3f} ms >>")
-            
+            print(f"<< cueq stc forward cost: {execution_time_ms:.3f} ms >>") """
+        
         return self.transpose_out(output[0])

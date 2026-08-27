@@ -209,25 +209,25 @@ class FullyConnectedTensorProduct(torch.nn.Module):
             if weight is not None:
                 raise ValueError("Internal weights are used, weight should be None")
             if self.use_fasteq:
-                torch.cuda.synchronize()
-                start_time = time.perf_counter() * 1000
+                #torch.cuda.synchronize()
+                #start_time = time.perf_counter() * 1000
 
                 output = self.ff([self.weight, x1, x2])
 
-                torch.cuda.synchronize()
-                end_time = time.perf_counter() * 1000
-                execution_time_ms = end_time - start_time
-                print(f"<< fasteq fctp forward cost: {execution_time_ms:.3f} ms >>")
+                #torch.cuda.synchronize()
+                #end_time = time.perf_counter() * 1000
+                #execution_time_ms = end_time - start_time
+                #print(f"<< fasteq fctp forward cost: {execution_time_ms:.3f} ms >>")
             else:
-                torch.cuda.synchronize()
-                start_time = time.perf_counter() * 1000
+                #torch.cuda.synchronize()
+                #start_time = time.perf_counter() * 1000
                 
                 output = self.f([self.weight, x1, x2])
 
-                torch.cuda.synchronize()
-                end_time = time.perf_counter() * 1000
-                execution_time_ms = end_time - start_time
-                print(f"<< cueq fctp forward cost: {execution_time_ms:.3f} ms >>")
+                #torch.cuda.synchronize()
+                #end_time = time.perf_counter() * 1000
+                #execution_time_ms = end_time - start_time
+                #print(f"<< cueq fctp forward cost: {execution_time_ms:.3f} ms >>")
         else:
             if weight is None:
                 raise ValueError(
@@ -235,24 +235,24 @@ class FullyConnectedTensorProduct(torch.nn.Module):
                 )
             else:
                 if self.use_fasteq:
-                    torch.cuda.synchronize()
-                    start_time = time.perf_counter() * 1000
+                    #torch.cuda.synchronize()
+                    #start_time = time.perf_counter() * 1000
 
                     output = self.ff([weight, x1, x2])
 
-                    torch.cuda.synchronize()
-                    end_time = time.perf_counter() * 1000
-                    execution_time_ms = end_time - start_time
-                    print(f"<< fasteq fctp forward cost: {execution_time_ms:.3f} ms >>")
+                    #torch.cuda.synchronize()
+                    #end_time = time.perf_counter() * 1000
+                    #execution_time_ms = end_time - start_time
+                    #print(f"<< fasteq fctp forward cost: {execution_time_ms:.3f} ms >>")
                 else:
-                    torch.cuda.synchronize()
-                    start_time = time.perf_counter() * 1000
+                    """ torch.cuda.synchronize()
+                    start_time = time.perf_counter() * 1000 """
 
                     output = self.f([weight, x1, x2])
 
-                    torch.cuda.synchronize()
+                    """ torch.cuda.synchronize()
                     end_time = time.perf_counter() * 1000
                     execution_time_ms = end_time - start_time
-                    print(f"<< cueq fctp forward cost: {execution_time_ms:.3f} ms >>")
+                    print(f"<< cueq fctp forward cost: {execution_time_ms:.3f} ms >>") """
 
         return self.transpose_out(output[0])

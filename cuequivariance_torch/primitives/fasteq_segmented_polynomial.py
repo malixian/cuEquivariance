@@ -841,7 +841,8 @@ class FastEqSegmentedPolynomial(nn.Module):
             if self.num_outputs != 1:
                     raise ValueError("equi_linear should have exactly one output")
             
-            if self.op_name == "equi_linear":
+            if False:
+            #if self.op_name == "equi_linear":
                 '''
                 if tuple(inputs[0].shape) == (1, 36864) or tuple(inputs[0].shape) == (1, 163840) or tuple(inputs[0].shape) == (1, 852992):
                         torch.cuda.synchronize()
