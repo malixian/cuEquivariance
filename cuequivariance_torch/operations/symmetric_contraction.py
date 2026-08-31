@@ -219,16 +219,8 @@ class SymmetricContraction(torch.nn.Module):
             and os.environ.get("FASTEQ_INFERENCE", "").strip().lower()
             in {"1", "true", "yes", "on"}
         )
-
-        if self.fast_inference:
-            self.register_buffer("project_weight",
-                                torch.empty(0, device=device, dtype=dtype),
-                                persistent=False)
-            
-            # 加载state_dict之后自动重算
-            self._update_project_weight_()
-            self.register_load_state_dict_post_hook(self._on_post_load)
-
+        
+        if self.use_fasteq:
             self.ff = cuet.FastEqSegmentedPolynomial(
                 self.etp.polynomial,
                 method=self.method,
@@ -236,6 +228,15 @@ class SymmetricContraction(torch.nn.Module):
                 use_fasteq=True,
                 op_name="stc", # symmetric contraction
             ).to(device)
+
+            if self.fast_inference:
+                self.register_buffer("project_weight",
+                                    torch.empty(0, device=device, dtype=dtype),
+                                    persistent=False)
+                
+                # 加载state_dict之后自动重算
+                self._update_project_weight_()
+                self.register_load_state_dict_post_hook(self._on_post_load)
 
         self.f = cuet.SegmentedPolynomial(
             self.etp.polynomial,
@@ -277,6 +278,7 @@ class SymmetricContraction(torch.nn.Module):
         """
         #print(f"STC weight shape: {self.weight.shape}, x shape: {x.shape}, indices shape: {indices.shape}")
 
+        print(f"fast_inference:{self.fast_inference}, use_fasteq:{self.use_fasteq}")
         if self.fast_inference:
 
             #torch.cuda.synchronize()
@@ -288,7 +290,15 @@ class SymmetricContraction(torch.nn.Module):
             #torch.cuda.synchronize()
             #end_time = time.perf_counter() * 1000
             #execution_time_ms = end_time - start_time
-            #print(f"<< fasteq stc forward cost: {execution_time_ms:.3f} ms >>")
+            #print(f"<< fasteq stc fast forward cost: {execution_time_ms:.3f} ms >>")
+        
+        elif self.use_fasteq:
+            if self.projection is not None:
+                weight = torch.einsum("zau,ab->zbu", self.weight, self.projection)
+            else:
+                weight = self.weight
+            weight = weight.flatten(1)
+            output = self.ff([weight, self.transpose_in(x)], input_indices={0: indices})
 
         else:
 
