@@ -461,7 +461,27 @@ def infer_fctp_meta(descriptor, math_dtype, device):
     
     print(f"cg_val_all:{cg_val_all}, shape:{cg_val_all.shape}", )
 
-    cg_val_0 = cg_val_all.reshape(-1)[0].item()
+    # check that all non-zero CG coefficients are identical
+    nonzero_cg_vals = cg_val_all[cg_val_all != 0]
+
+    if nonzero_cg_vals.numel() == 0:
+        raise ValueError("cg_val_all does not contain any non-zero CG coefficients.")
+
+    cg_val_ref = nonzero_cg_vals[0]
+
+    if not torch.allclose(
+        nonzero_cg_vals,
+        cg_val_ref.expand_as(nonzero_cg_vals),
+        rtol=1e-5,
+        atol=1e-8,
+    ):
+        unique_vals = torch.unique(nonzero_cg_vals.detach().cpu())
+        raise ValueError(
+            "FCTP requires all non-zero CG coefficients to be identical, "
+            f"but found different values: {unique_vals.tolist()}"
+        )
+
+    cg_val_0 = cg_val_ref.item()
 
     return {
         "cg_indices": cg_indices,
